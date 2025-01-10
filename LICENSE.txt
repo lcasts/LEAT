@@ -1,4 +1,4 @@
-    Launch Emission Calculation Tool (LEAT)
+    Launch Emission Assessment Tool (LEAT)
     Copyright (C) 2025 Jan-Steffen Fischer and Sebastian Winterhoff
 
     This program is free software: you can redistribute it and/or modify
