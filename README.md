@@ -151,7 +151,7 @@ Jan-Steffen Fischer and Sebastian Winterhoff and Stefanos Fasoulas, Launch Emiss
 
 ---
 
-## **Acknowledgments**
+## **Contact**
 - If you have questions, remarks or wishes please contact us under fischerj[at]irs.uni-stuttgart.de
 
 ---
