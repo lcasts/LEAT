@@ -254,7 +254,6 @@ def trajectory_ODE(t,y,*ode_args):
     temp = y[11]
     F = y[12]
     mdot = y[13]
-    print('mdot',mdot)
     
     # 2.) Definition of Phases and Phase Changes
     phase_changed, current_phase, prev_phase = get_phases(t, max_step, phases, phase_intervals)
@@ -270,9 +269,6 @@ def trajectory_ODE(t,y,*ode_args):
         dmdot = 0         # No derivative at t=0
     else:
         massflow, y[13], dmdot = calculate_massflow(current_phase)
-    print('massflow',massflow)
-    print('dmdot',dmdot)
-    print('y[13]',y[13])
     
     # 4.) Final ODE-System
     dv = ((F-F_W)/m - g*np.sin(gamma))                          # m/s

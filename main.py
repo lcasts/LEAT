@@ -49,3 +49,7 @@ for idx, scenario_name in enumerate(df_scenarios.index, start=1):
                 rocket_case = "frozen"
                 emission_results = emissions.run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_engines, df_launch_vehicles, scenario_name, df_emission_factors, rocket_case)
                 data_processing.save_emission_results(emission_results, scenario_name, "NASA_CEA_Frozen")
+        
+        if use_cantera:   
+            emission_results = emissions.run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_engines, df_launch_vehicles, scenario_name, df_emission_factors)
+            data_processing.save_emission_results(emission_results, scenario_name, "Cantera")

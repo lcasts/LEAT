@@ -8,10 +8,9 @@ import numpy as np
 #### Choose which Scenarios to process ####
 #-------------------------------------
 all_scenarios = False       # When False only the user_defined_scenarios will be processed
-user_defined_scenarios = ["2023-013_Starlink5492"]             # Based on the scenario name
+user_defined_scenarios = ["2023-010_Starlink5277"]       #2023-010_Starlink5277      # Based on the scenario name
 use_external_trajectory_data = True
-file_name_ext_trajectory = 'input_data/trajectory_results_cleaned.csv' 
-#user_defined_scenarios = ["Ariane5_geo_10", "Falcon9_iss_5"]             # Based on the scenario name
+file_name_ext_trajectory = 'input_data/trajectory_results_cleaned.csv'
 #endregion
 
 #region: #### Trajectory Config ####
@@ -33,6 +32,7 @@ height_ode_break = 100e3    # Maximum Simulation Height [m]
 R_0 = 6.378388e6            # Mean Earth Radius [m] (WGS84)
 g_0 = 9.807                 # Mean Earth Gravity [m/s²]
 R = 287.058                 # J/(kg·K)      for p = ρ⋅R⋅T
+kappa = 1.4                  # Ratio of specific heats (Cp/Cv) for air
 
 #### Initial Values (Trajectory ODE) ####
 #-------------------------------------
@@ -63,6 +63,7 @@ calculate_emissions = True
 use_emission_factors = True
 emission_factor_method = "stoichiometric"
 use_nasa_cea = False
+use_cantera = False
 
 # Choose if you want to include Black Carbon in the results
 calculate_black_carbon = True
@@ -71,15 +72,15 @@ calculate_black_carbon = True
 #-------------------------------------
 # Molar masses of the atm species in kg/mol
 molar_masses = {
-    '*N2': 28.0134e-3,  # kg/mol
-    '*O2': 31.9988e-3,  # kg/mol
-    '*O': 16.00e-3,     # kg/mol
-    '*He': 4.002602e-3, # kg/mol
-    '*H': 1.00784e-3,   # kg/mol
-    '*Ar': 39.948e-3,   # kg/mol
+    'N2': 28.0134e-3,  # kg/mol
+    'O2': 31.9988e-3,  # kg/mol
+    'O': 16.00e-3,     # kg/mol
+    'He': 4.002602e-3, # kg/mol
+    'H': 1.00784e-3,   # kg/mol
+    'Ar': 39.948e-3,   # kg/mol
     'N': 14.0067e-3,   # kg/mol
     #'aox': 16.00e-3,   # Anomalous oxygen, assume same as O
-    '*NO': 30.0061e-3   # kg/mol
+    'NO': 30.0061e-3   # kg/mol
 }
 
 # Avogadro's number

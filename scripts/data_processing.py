@@ -47,7 +47,7 @@ def get_input_data():
     try:
         # 1) Import Emission Factors
         df_emission_factors = pd.DataFrame()
-        if use_emission_factors or (use_nasa_cea and calculate_black_carbon):
+        if use_emission_factors or (use_nasa_cea and calculate_black_carbon) or (use_cantera and calculate_black_carbon):
             ef_path = os.path.join(input_data_folder_path, file_name_emission_factors)
             df_emission_factors = pd.read_excel(ef_path, index_col=None, sheet_name=sheet_name_emission_factors)
             df_emission_factors = df_emission_factors.fillna(0)
@@ -71,6 +71,11 @@ def get_input_data():
         df_scenarios = pd.read_excel(s_path, index_col=0, sheet_name=sheet_name_scenarios)
         df_scenarios.drop('note', axis=1, inplace=True)
         # 4.2) Filter Scenarios
+        missing_scenarios = [s for s in user_defined_scenarios if s not in df_scenarios.index]
+
+        if missing_scenarios:
+            print(f"Warning: The following scenarios are not in the scenarios.xlsx file and will be ignored: {missing_scenarios}")
+
         if all_scenarios:
             pass
         else:
@@ -658,15 +663,15 @@ def calculate_atmosphere_data(row):
     
     # Raw Density Data of Species (in molecules per m3)
     densities = {
-        '*N2': handle_nan(atmosphere[0, 1]),
-        '*O2': handle_nan(atmosphere[0, 2]),
-        '*O': handle_nan(atmosphere[0, 3]),
-        '*He': handle_nan(atmosphere[0, 4]),
-        '*H': handle_nan(atmosphere[0, 5]),
-        '*Ar': handle_nan(atmosphere[0, 6]),
+        'N2': handle_nan(atmosphere[0, 1]),
+        'O2': handle_nan(atmosphere[0, 2]),
+        'O': handle_nan(atmosphere[0, 3]),
+        'He': handle_nan(atmosphere[0, 4]),
+        'H': handle_nan(atmosphere[0, 5]),
+        'Ar': handle_nan(atmosphere[0, 6]),
         'N': handle_nan(atmosphere[0, 7]),
         #'aox': handle_nan(atmosphere[0, 8]),
-        '*NO': handle_nan(atmosphere[0, 9])
+        'NO': handle_nan(atmosphere[0, 9])
     }
     
     # Convert number densities to mass densities (kg/m3)
