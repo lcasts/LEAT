@@ -57,7 +57,7 @@ def plot_top5_emissions_per_bin(binned_emissions, save_name):
     plt.ylabel('Altitude')
     plt.legend(title='Species', bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
-    plt.savefig(f"{save_name}_bar_chart.png")
+    plt.savefig(f"output_data/plots/{save_name}_bar_chart.png")
     plt.show()
 
 # --- Plot Pie Chart for Total Emissions ---
@@ -83,7 +83,7 @@ def plot_emissions_pie(df, emissions, save_name):
         autotext.set_fontsize(9)
     ax.set_title('Total Emission Share per Species')
     plt.tight_layout()
-    plt.savefig(f"{save_name}_pie_chart.png")
+    plt.savefig(f"output_data/plots/{save_name}_pie_chart.png")
     plt.show()
 
 # --- Save Total Emissions to Excel ---
@@ -92,11 +92,11 @@ def save_emissions_summary(df, emissions, save_name):
     total_sum = total_emissions.sum()
     summary_df = total_emissions.to_frame(name='Total Emissions [kg]')
     summary_df.loc['TOTAL'] = total_sum
-    summary_df.to_excel(f"{save_name}_emissions_summary.xlsx")
+    summary_df.to_excel(f"output_data/plots/{save_name}_emissions_summary.xlsx")
 
 # --- Main Execution ---
 def main():
-    file_path = 'output_data\emissions\EMIS_2023-013_Starlink5492_NASA_CEA_Equilibrium(1).csv'  # Replace with your CSV file path
+    file_path = 'output_data/emissions/EMIS_2023-013_Starlink5492_Emission_Factors.csv'  # Replace with your CSV file path
     save_name = os.path.splitext(os.path.basename(file_path))[0]  # Extract filename without extension
     df, emission_cols = read_emissions_csv(file_path)
     binned_emissions = aggregate_by_altitude(df, emission_cols)

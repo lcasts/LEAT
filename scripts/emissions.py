@@ -765,7 +765,6 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_emission_facto
         
         # (a) Iterate through every "row" of the trajectory dataset
         for idx, row in df_trajectory_results_cleaned.iterrows():
-            
             # Filter data
             active_phases = row['active_phases']
             time_intervals = row['time_interval']
@@ -857,9 +856,10 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_emission_facto
             # Append total_row_emissions to total_emissions after iteration (b), (c) and (d) are finished
             total_emissions = pd.concat([total_emissions, total_row_emissions])
             total_emissions = total_emissions.fillna(0)
-        
+            total_emissions['total_sum_species'] = total_emissions.iloc[:, 10:].sum(axis=1)
+
         # Combine total_emissions into emission_results, while dropping the initial non-species columns of total_emissions
-        emission_results = pd.concat([emission_results, total_emissions.iloc[:, 7:]], axis=1)
+        emission_results = pd.concat([emission_results, total_emissions.iloc[:, 9:]], axis=1)
         
     except Exception as e:
         data_processing.handle_error(e, "emission_factors", "Error in Emission Factors main function.")

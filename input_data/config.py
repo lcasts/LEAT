@@ -10,7 +10,7 @@ import numpy as np
 all_scenarios = False       # When False only the user_defined_scenarios will be processed
 user_defined_scenarios = ["2023-013_Starlink5492"]    # Based on the scenario name
 use_external_trajectory_data = True
-file_name_ext_trajectory = 'output_data/trajectory/trajectory_2023-013_Starlink5492_input.csv'
+file_name_ext_trajectory = 'input_data/trajectory_2023-013_Starlink5492_input.csv'
 #endregion
 
 #region: #### Trajectory Config ####

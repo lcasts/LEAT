@@ -4,7 +4,8 @@ import os
 folders = ["output_data/data_raw/excel/",
            "output_data/data_raw/txt/",
            "output_data/emissions/",
-           "output_data/trajectory"]
+           "output_data/trajectory",
+           "output_data/plots/"]
 
 def delete_files_in_folders(folder_list):
     for folder in folder_list:
