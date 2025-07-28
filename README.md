@@ -126,6 +126,7 @@ Jan-Steffen Fischer and Sebastian Winterhoff and Stefanos Fasoulas, Launch Emiss
 1. **Input Data Requirements**:
 
    - Ensure `LV_Database.xlsx` contains aerodynamic variables; otherwise, the ODE solver will fail.
+   - Ensure `trajectory_input.csv` has the given column structure with t,h,date,lon,lat,v,d_m,active_phases,time_interval
    - For Black Carbon calculation, fuel names must match entries (BC) in `emission_factors.xlsx`.
 
 2. **Simulation Details**:

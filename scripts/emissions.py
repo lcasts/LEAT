@@ -10,9 +10,11 @@ import math
 import warnings
 import pandas as pd
 import cantera as ct
+import ast
+import shutil
+import io
 from scripts import data_processing
 from scripts import trajectory
-from ast import literal_eval
 from scipy.optimize import fsolve
 
 # Suppress warnings from openpyxl
@@ -22,8 +24,8 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 #endregion
 
-#region: Additional subfunctions to process the two main functions
-# Generating an engine dataframe for first NASA CEA calculations
+#region: General Helper Functions
+# Generating an engine dataframe for NASA CEA and Cantera calculations
 def create_engine_df(df_phases, df_launch_vehicles_engines):
     # Function to convert fuel mass to mass fractions
     def to_mass_fraction(mass_list):
@@ -59,6 +61,57 @@ def create_engine_df(df_phases, df_launch_vehicles_engines):
 
     return engine_df
 
+# Save formated Results to Excel
+def save_results_excel(filename, s_name, df_output, rocket_case=None):
+    folder = output_data_folder_path_excel
+    base_name = filename + "_" + s_name
+    if rocket_case:
+        base_name = filename + "_" + s_name + "_" + rocket_case
+    
+    filename, file_path = data_processing.get_unique_filename(base_name, folder, ".xlsx")
+    
+    with pd.ExcelWriter(folder + filename, engine='openpyxl') as writer:
+        df_output.to_excel(writer, sheet_name=filename)
+
+# Function to Calculate Final Black Carbon Emission Index
+def black_carbon(height, factor):
+    result = factor * max(0.04, min(1, 0.04 * math.exp(0.12 * (height - 15))))
+    
+    return result
+
+
+# Function to calculate the rof for afterbuning
+def rof_ab_calc(x_ab, dia, mf_engine, rho_atm, v_rocket):
+    rof_ab = v_rocket*rho_atm*np.pi*(((dia*x_ab)**2-dia**2)/4)/mf_engine
+    return rof_ab
+
+# Function to create the current relevant Fuel Dataset (phase, engine, interval_fuel_mass)
+def create_fuel_tuple(current_phase, phase, phase_time_interval, time_interval):
+    fuel_data = []
+
+    # Check if booster data is available and calculate fuel-related parameters
+    if not pd.isna(current_phase["booster_engine"]):
+        booster_engine = current_phase["booster_engine"]
+        booster_fuel_masses = current_phase["booster_fuel_mass"]
+        booster_massflow = sum(booster_fuel_masses) / phase_time_interval
+        interval_booster_fuel_mass  = booster_massflow * time_interval
+        # Add data to fuel_data list
+        fuel_data.append((phase, booster_engine, interval_booster_fuel_mass))
+
+    # Check if stage data is available and calculate fuel-related parameters
+    if not pd.isna(current_phase["stage_engine"]):
+        stage_engine = current_phase["stage_engine"]
+        stage_fuel_masses = current_phase["stage_fuel_mass"]
+        stage_massflow = sum(stage_fuel_masses) / phase_time_interval
+        interval_stage_fuel_mass = stage_massflow * time_interval
+        # Add data to fuel_data list
+        fuel_data.append((phase, stage_engine, interval_stage_fuel_mass))
+        
+    return fuel_data
+
+#endregion
+
+#region: CEA Helper Functions
 # Function to create the NASA CEA .inp file
 def create_inp_file(problem, filename, rocket_case=None, df=None, *args):
     def generate_chemical_formula_string(chemical_formula):
@@ -89,6 +142,63 @@ def create_inp_file(problem, filename, rocket_case=None, df=None, *args):
         for j in range(len(df['fuel'])):
             fuel_name = df['fuel'][j]
             fuel_mass_fraction = df['fuel_mf'][j]
+            fuel_temp = df['fuel_temp'][j]
+            
+            # Check if the current fuel is in special_fuels
+            if fuel_name in special_fuels:
+                # Retrieve the special fuel's data
+                fuel_data = special_fuels[fuel_name]
+                enthalpy = fuel_data["enthalpy"]
+                chemical_formula = fuel_data["chemical_formula"]
+                formula_str = generate_chemical_formula_string(chemical_formula)
+                
+                # Include detailed fuel definition for special fuels
+                inp_string += (
+                    f"  name={fuel_name} wt={fuel_mass_fraction} t,k={fuel_temp} "
+                    f"h,kj/mol={enthalpy} {formula_str} \n"
+                )
+            else:
+                # Standard definition for non-special fuels
+                inp_string += f"  name={fuel_name} wt={fuel_mass_fraction} t,k={fuel_temp} \n"
+
+        inp_string += "output  \n"
+        #inp_string += "  siunits massf \n"
+        inp_string += "  siunits massf trace={} \n".format(trace)
+        #inp_string += "  siunits massf transport \n"
+        inp_string += "  plot p t mach H rho s \n"
+        inp_string += "end \n"
+        
+        return inp_string
+    
+    def create_inp_string_rocket_oc(df, case_string):
+        # Check for exception fuels in the dataframe
+        has_exception_fuel = any(fuel in frozen_nfz_exception_fuels for fuel in df['fuel'])
+        
+        # Adjust nfz value if exception fuel is present
+        if "frozen" in case_string and has_exception_fuel:
+            case_string = f"frozen nfz={frozen_nfz_exception}"
+        elif "frozen" in case_string:
+            case_string = f"frozen nfz={frozen_nfz}"
+        
+        rof_gg = df.loc['rof_oc']
+        m_fu_gg = 1 / (1+rof_gg)
+        m_ox_gg = rof_gg / (1 + rof_gg)
+        mf_gg = [m_fu_gg, m_ox_gg]
+        
+        inp_string = "problem \n"
+        inp_string += f"  rocket {case_string} \n"
+        #inp_string += "  rocket equilibrium tcest,k={} \n".format(df.loc[i, 'tcest'])
+        inp_string += "  p,(bar)={}, \n".format(df['p_chamber_oc'])
+        inp_string += "  sup,ae/at={}, \n".format(df['Ae/At_oc'])
+        #if nozzle == True:
+        #    inp_string += "  sup,ae/at={} \n".format(df.loc[i, 'nozzle_expansion_ratio'])
+        #if pressure == True:
+        #    inp_string += "  pip={} \n".format(df.loc[i, 'chamber_pressure'][k]/df.loc[i, 'p_end'])      
+                      
+        inp_string += "react \n"
+        for j in range(len(df['fuel'])):
+            fuel_name = df['fuel'][j]
+            fuel_mass_fraction = mf_gg[j]
             fuel_temp = df['fuel_temp'][j]
             
             # Check if the current fuel is in special_fuels
@@ -175,6 +285,17 @@ def create_inp_file(problem, filename, rocket_case=None, df=None, *args):
 
         with open(filename + ".inp", "w") as file:
             file.write(inp_string)
+    
+    elif problem == "rocket_oc":
+        if rocket_case == "equilibrium":
+            case_string = "equilibrium"
+        elif rocket_case == "frozen":
+            case_string = "frozen"
+            
+        inp_string = create_inp_string_rocket_oc(df, case_string)
+
+        with open(filename + ".inp", "w") as file:
+            file.write(inp_string)
             
     elif problem == "afterburning":
         t_ab, p_ab, rho_ab, s_ab, t_fuel, rho_fuel, t_air, rof_ab, df_fuel_massfractions, df_air_massfractions = args
@@ -183,39 +304,6 @@ def create_inp_file(problem, filename, rocket_case=None, df=None, *args):
         
         with open(filename + ".inp", "w") as file:
             file.write(inp_string)
-
-def save_output_files_cantera(df_output, filename, s_name):
-    # Convert dictionary to a string for .txt file
-    output_txt = "Temperature: {}\nPressure: {}\nEmissions:\n".format(
-        df_output['Temperature'], df_output['Pressure'])
-    for species, value in df_output['Emissions'].items():
-        output_txt += "{}: {}\n".format(species, value[0])
-
-    # Save .txt file
-    base_name_txt = filename + "_" + s_name
-    new_filename_txt, file_path_txt = data_processing.get_unique_filename(base_name_txt, output_data_folder_path_raw, ".txt")
-    with open(file_path_txt, "w") as txt_file:
-        txt_file.write(output_txt)
-    shutil.move(file_path_txt, os.path.join(output_data_folder_path_raw, new_filename_txt))
-
-    # Convert dictionary to a pandas DataFrame for .xlsx file
-    emissions_data = {
-        'Species': list(df_output['Emissions'].keys()),
-        'Emissions Value': [value[0] for value in df_output['Emissions'].values()]
-    }
-    df_emissions = pd.DataFrame(emissions_data)
-
-    # Adding temperature and pressure as separate columns
-    df_emissions['Temperature'] = df_output['Temperature']
-    df_emissions['Pressure'] = df_output['Pressure']
-
-    # Save .xlsx file
-    base_name_excel = filename + "_" + s_name
-    new_filename_excel, file_path_excel = data_processing.get_unique_filename(base_name_excel, output_data_folder_path_excel, ".xlsx")
-    with pd.ExcelWriter(file_path_excel, engine='openpyxl') as writer:
-        df_emissions.to_excel(writer, sheet_name=new_filename_excel)
-
-    shutil.move(file_path_excel, os.path.join(output_data_folder_path_excel, new_filename_excel))
 
 # Copy necessary files to run NASA CEA in main directory
 def init_directory():
@@ -228,220 +316,6 @@ def init_directory():
         except FileNotFoundError:
             pass
 
-def calculate_reactant_enthalpy(fuel, oxidizer, equivalence_ratio, fuel_temp, oxidizer_temp, pressure):
-    # Konvertiere Temperaturen und Druck zu float, falls nötig
-    fuel_temp = float(fuel_temp)
-    oxidizer_temp = float(oxidizer_temp)
-    pressure = float(pressure)
-
-    # Ausgabe der Werte und ihrer Datentypen
-    
-    gas = ct.Solution('gri30.yaml')
-    
-    # Set the mixture equivalence ratio
-    gas.set_equivalence_ratio(equivalence_ratio, fuel, oxidizer)
-
-    # Get the fuel and oxidizer mass fractions
-    fuel_fraction = gas.mole_fraction_dict()[fuel]
-    oxidizer_fraction = gas.mole_fraction_dict()[oxidizer]
-
-    # Create separate states for fuel and oxidizer
-    fuel_gas = ct.Solution('gri30.yaml')
-    fuel_gas.TPX = fuel_temp, pressure, {fuel: 1.0}
-
-    oxidizer_gas = ct.Solution('gri30.yaml')
-    oxidizer_gas.TPX = oxidizer_temp, pressure, {oxidizer: 1.0}
-
-    # Calculate the mixture enthalpy as a weighted average
-    total_mass = fuel_fraction + oxidizer_fraction
-    
-    mixture_enthalpy = (
-        fuel_fraction / total_mass * fuel_gas.h +
-        oxidizer_fraction / total_mass * oxidizer_gas.h
-    )
-
-    return mixture_enthalpy
-
-def mach_number(expansion_ratio):
-    def equation(Me):
-        return (( (kappa+1)/2 ) ** (-(kappa+1)/(2*(kappa-1)))) * (1 + Me**2 * (kappa-1)/2) ** ((kappa+1)/(2*(kappa-1))) - expansion_ratio
-    
-    # Initial guess for Me (subsonic and supersonic solutions)
-    Me_guess = [2.0]  # One subsonic and one supersonic guess
-    try:
-        solutions = [fsolve(equation, guess)[0] for guess in Me_guess]
-    except Exception as e:
-        print(f"Error in fsolve for supersonic solution: {e}")
-        return None
-    
-    # Filter only valid positive solutions
-    solutions = [sol for sol in solutions if sol > 0]
-    return solutions
-
-def combustion_chamber(fuel, oxidizer, rof, pressure, enthalpy):
-    # Check the fuel type and select the appropriate mechanism
-    MW_H2 = 2.016    # Hydrogen (H2)
-    MW_CH4 = 16.04   # Methane (CH4)
-    MW_O2 = 32.00    # Oxygen (O2)
-    gri30_species = set(ct.Solution('gri30.yaml').species_names)
-
-    if fuel == "H2":
-        gas = ct.Solution('h2o2.yaml')
-        mass_ratio_H2_O2_real = rof
-        mass_ratio_H2_O2_stoich = 7.9366827390519274
-        molar_ratio_H2_O2_real = mass_ratio_H2_O2_real * (MW_H2 / MW_O2)
-        molar_ratio_H2_O2_stoich = mass_ratio_H2_O2_stoich * (MW_H2 / MW_O2)
-        equivalence_ratio = molar_ratio_H2_O2_stoich / molar_ratio_H2_O2_real
-
-    elif fuel == "CH4":
-        gas = ct.Solution('gri30.yaml')
-        mass_ratio_CH4_O2_real = rof
-        mass_ratio_CH4_O2_stoich = 3.989263492008084
-        molar_ratio_CH4_O2_real = mass_ratio_CH4_O2_real * (MW_CH4 / MW_O2)
-        molar_ratio_CH4_O2_stoich = mass_ratio_CH4_O2_stoich * (MW_CH4 / MW_O2)
-        equivalence_ratio = molar_ratio_CH4_O2_stoich / molar_ratio_CH4_O2_real
-    else:
-        raise ValueError("Unsupported fuel type. Supported fuels: H2, CH4, RP-1 (C12H24).")
-  
-    # Set initial temperature
-    gas.TP = 3000, pressure  # Set temperature to 3000K and pressure
-    # Set equivalence ratio and conditions
-    gas.set_equivalence_ratio(equivalence_ratio, fuel, oxidizer)
-    gas.HP = enthalpy, pressure  # Set enthalpy and pressure to define conditions
-    gas.equilibrate('HP')
-    
-    # Extract emissions
-    emissions = {species: gas.Y[gas.species_index(species)] for species in gas.species_names}
-
-    return gas
-
-def nozzle_expansion(gas, throat_area, exit_area):
-    # Initial conditions from the combustion chamber
-    T_0 = gas.T
-    P_0 = gas.P
-    rho_0 = P_0 / (R * T_0)
-    
-    # Calculate Gamma using the provided equation
-    Gamma = (kappa ** 0.5) * ((2 / (kappa + 1)) ** ((kappa + 1) / (2 * (kappa - 1))))
-    
-    # Throat conditions (Mach = 1)
-    T_throat = T_0 * (1 + ((kappa - 1) / 2) * 1**2) ** -1
-    P_throat = P_0 * (1 + ((kappa - 1) / 2) * 1**2) ** (-kappa / (kappa - 1))
-    rho_throat = rho_0 * (1 + ((kappa - 1) / 2) * 1**2) ** (-1 / (kappa - 1))
-    v_throat = (kappa * R * T_throat) ** 0.5
-    mass_flow = rho_throat * v_throat * throat_area
-    
-    # Calculate exit pressure using area ratio equation
-    area_ratio = exit_area / throat_area
-    
-    # Calculate exit Mach number using isentropic relation
-    M_exit = mach_number(area_ratio)[0]
-    
-    # Calculate exit temperature and density
-    T_exit = T_0 * (1 + ((kappa - 1) / 2) * M_exit**2) ** -1
-    P_exit = P_0 * (1 + ((kappa - 1) / 2) * M_exit**2) ** (-kappa / (kappa - 1))
-    rho_exit = rho_0 * (1 + ((kappa - 1) / 2) * M_exit**2) ** (-1 / (kappa - 1))
-    v_exit = M_exit * (kappa * R * T_exit) ** 0.5
-    
-    # Set gas properties and equilibrate
-    throat_gas = gas
-    throat_gas.TP = T_throat, P_throat
-    throat_gas.equilibrate('SP')
-    exit_gas = throat_gas
-    exit_gas.TP = T_exit, P_exit
-    exit_gas.equilibrate('SP')
-    throat_props = {
-        'Mach': 1,
-        'Temperature': T_throat,
-        'Pressure': P_throat,
-        'Density': rho_throat,
-        'Velocity': v_throat
-    }
-    
-    exit_props = {
-        'Mach': M_exit,
-        'Temperature': T_exit,
-        'Pressure': P_exit,
-        'Density': rho_exit,
-        'Velocity': v_exit
-    }
-    
-    # Emissions calculation
-    emissions = {species: gas.Y[gas.species_index(species)] for species in gas.species_names}
-    return {
-        'Throat': throat_props,
-        'Exit': exit_props,
-        'ExitGas': exit_gas,
-        'Emissions': emissions
-    }
-
-def atmosphere_mixing(t_ab, p_ab, rho_ab, s_ab, t_fuel, t_air, exit_gas, df_air_massfractions, rof_ab):
-    # **Step 1: Extract Exit Conditions**
-    exit_temperature = t_ab
-    exit_pressure = p_ab
-
-    # **Step 2: Map Species Names to Cantera Convention**
-    species_mapping = {
-        '*N2': 'N2', '*O2': 'O2', '*O': 'O', '*He': 'He',
-        '*H': 'H', '*Ar': 'Ar', '*N': 'N', '*NO': 'NO'
-    }
-    
-    # Convert DataFrame species names using mapping
-    ambient_mass_fractions = {
-        species_mapping.get(species, species): value
-        for species, value in df_air_massfractions.iloc[0].items()
-        if species_mapping.get(species, species) in ct.Solution('gri30.yaml').species_names
-    }
-    new_total_mass_fraction = sum(ambient_mass_fractions.values())
-
-    # Normalize mass fractions so they sum to 1
-    if new_total_mass_fraction > 0:
-        normalized_air_mass_fractions = {
-            species: value / new_total_mass_fraction
-            for species, value in ambient_mass_fractions.items()
-        }
-    else:
-        normalized_air_mass_fractions = ambient_mass_fractions  # Avoid division by zero
-
-    
-    # **Step 3: Calculate Ambient Mass Flow Rate Using rof_ab**
-    massflow_exit = sum(exit_gas.values())
-    massflow_air = massflow_exit * rof_ab  # Calculate the air mass flow rate
-    total_massflow = massflow_exit + massflow_air
-
-    # Scale ambient mass fractions by massflow_air
-    scaled_ambient_mass_fractions = {species: value * massflow_air for species, value in normalized_air_mass_fractions.items()}
-
-    # **Step 4: Normalize Mass Fractions**
-    mixed_mass_fractions = {
-        species: (exit_gas.get(species, 0) * massflow_exit + scaled_ambient_mass_fractions.get(species, 0)) / total_massflow
-        for species in set(exit_gas.keys()).union(set(normalized_air_mass_fractions.keys()))
-    }
-
-    # **Step 5: Set Up Cantera Gas Object**
-    try:
-        gas = ct.Solution('gri30.yaml')  # Use gri30.yaml instead of air.yaml
-        gas.TP = max(max(exit_temperature, t_ab),300), max(exit_pressure, p_ab)
-        gas.Y = {species: value for species, value in mixed_mass_fractions.items() if species in gas.species_names}
-    except ct.CanteraError as e:
-        print(f"Error initializing gas mixture: {e}")
-        return None
-
-    # **Step 6: Perform HP Combustion**
-    try:
-        gas.equilibrate('HP')  # Equilibrate at constant enthalpy and pressure
-    except ct.CanteraError as e:
-        print(f"Error in HP Combustion: {e}")
-        return None
-
-    # **Step 7: Extract Post-Combustion Properties**
-    emissions = {species: gas[species].Y for species in gas.species_names if gas[species].Y > 1e-6}
-
-    return {
-        'Temperature': gas.T,
-        'Pressure': gas.P,
-        'Emissions': emissions
-    }
 
 # Save files to output data as backup
 def save_files(filename, s_name, rocket_case=None):
@@ -460,18 +334,6 @@ def save_files(filename, s_name, rocket_case=None):
             shutil.move(new_filename, os.path.join(folder, new_filename))
         except FileNotFoundError:
             pass
-
-# Save formated Results to Excel
-def save_results_excel(filename, s_name, df_output, rocket_case=None):
-    folder = output_data_folder_path_excel
-    base_name = filename + "_" + s_name
-    if rocket_case:
-        base_name = filename + "_" + s_name + "_" + rocket_case
-    
-    filename, file_path = data_processing.get_unique_filename(base_name, folder, ".xlsx")
-    
-    with pd.ExcelWriter(folder + filename, engine='openpyxl') as writer:
-        df_output.to_excel(writer, sheet_name=filename)
                 
 # Move and delete all files created by NASA CEA
 def clean_directory(filename):
@@ -493,14 +355,6 @@ def clean_up():
             os.remove(file)
         except FileNotFoundError:
             pass  
-
-# Function to calculate the rof for afterbuning
-def rof_ab_calc(rof_f, dia, mf_engine, rho_atm, v_rocket):
-    rof_ab = v_rocket*rho_atm*np.pi*(((dia*rof_f)**2-dia**2)/4)/mf_engine
-    return rof_ab
-
-def clean_species_name(species_name):
-    return species_name.strip('*').strip()
 
 # Function to read in the plt file
 def read_plt_file(plt_filename):
@@ -635,9 +489,14 @@ def readCEA(problem, filename, rocket_case=None):
         mass_fractions_df = pd.DataFrame(columns=['exit'])
         
         for item in cleaned_lines:
+            if '******' in item[1]:
+                item[1] = item[1].replace('******', '1.00')
+                print(f"CEA error workaround: Replaced '******' with '1.00' in item: {item}")
+
             if '*****' in item[1]:
                 item[1] = item[1].replace('*****', '1.00')
                 print(f"CEA error workaround: Replaced '*****' with '1.00' in item: {item}")
+                
             parts = item[1].split('-') if '-' in item[1] else item[1].split('+')
             result = float(parts[0]) * 10**(-int(parts[1])) if '-' in item[1] else float(parts[0]) * 10**(int(parts[1]))
             new_df = pd.DataFrame({'exit': result}, index=[item[0]])
@@ -654,41 +513,15 @@ def readCEA(problem, filename, rocket_case=None):
     
     # Execute respective function based on problem type
     if problem == "rocket":
-        output_df = read_rocket(rocket_case)  
+        output_df = read_rocket(rocket_case)
+    elif problem == "rocket_oc":
+        output_df = read_rocket(rocket_case)
     elif problem != "rocket":
         output_df = read_problem()
 
     return output_df
 
-# Function to create the current relevant Fuel Dataset (phase, engine, interval_fuel_mass)
-def create_fuel_tuple(current_phase, phase, phase_time_interval, time_interval):
-    fuel_data = []
 
-    # Check if booster data is available and calculate fuel-related parameters
-    if not pd.isna(current_phase["booster_engine"]):
-        booster_engine = current_phase["booster_engine"]
-        booster_fuel_masses = current_phase["booster_fuel_mass"]
-        booster_massflow = sum(booster_fuel_masses) / phase_time_interval
-        interval_booster_fuel_mass  = booster_massflow * time_interval
-        # Add data to fuel_data list
-        fuel_data.append((phase, booster_engine, interval_booster_fuel_mass))
-
-    # Check if stage data is available and calculate fuel-related parameters
-    if not pd.isna(current_phase["stage_engine"]):
-        stage_engine = current_phase["stage_engine"]
-        stage_fuel_masses = current_phase["stage_fuel_mass"]
-        stage_massflow = sum(stage_fuel_masses) / phase_time_interval
-        interval_stage_fuel_mass = stage_massflow * time_interval
-        # Add data to fuel_data list
-        fuel_data.append((phase, stage_engine, interval_stage_fuel_mass))
-        
-    return fuel_data
-
-# Function to Calculate Final Black Carbon Emission Index
-def black_carbon(height, factor):
-    result = factor * max(0.04, min(1, 0.04 * math.exp(0.12 * (height - 15))))
-    
-    return result
 
 # Handle NASA CEA Errors
 def handle_nasa_cea_error_message():
@@ -739,6 +572,183 @@ def handle_nasa_cea_error_message():
 
 #endregion
 
+#region: Cantera Helper Functions
+
+species_to_phase = {
+    "H2(L)": "h2_liquid",
+    "O2(L)": "o2_liquid",
+    "C2H8N2(L),UDMH": "udmh",
+    "CH4(L)": "ch4_liquid",
+    "CH6N2(L)": "hydrazine",
+    "N2O4(L)": "n2o4_liquid",
+    "RP-1": "rocket_propellant",
+    "Al(cr)": "aluminium",
+    "NH4CLO4(I)": "apn",
+    "HTPB": "htpb_binder",
+    "PBAN": "pban_binder"
+}
+
+phases_to_phase = {
+    "h2_liquid": "hydrolox_gas",
+    "udmh": "carbonitrolox_gas",
+    "ch4_liquid": "carbolox_gas",
+    "hydrazine": "carbonitrolox_gas",
+    "rocket_propellant": "carbolox_gas",
+    "aluminium": "solid_condensed",
+    "NH4CLO4(I)": "solid_gas"
+}
+
+def get_thermo_derivatives(gas):
+    '''Gets thermo derivatives based on shifting equilibrium.
+    '''
+    # unknowns for system with no condensed species:
+    # dpi_i_dlogT_P (# elements)
+    # dlogn_dlogT_P
+    # dpi_i_dlogP_T (# elements)
+    # dlogn_dlogP_T
+    # total unknowns: 2*n_elements + 2
+
+    num_var = 2 * gas.n_elements + 2
+
+    coeff_matrix = np.zeros((num_var, num_var))
+    right_hand_side = np.zeros(num_var)
+
+    tot_moles = 1.0 / gas.mean_molecular_weight
+    moles = gas.X * tot_moles
+
+    condensed = False
+
+    # indices
+    idx_dpi_dlogT_P = 0
+    idx_dlogn_dlogT_P = idx_dpi_dlogT_P + gas.n_elements
+    idx_dpi_dlogP_T = idx_dlogn_dlogT_P + 1
+    idx_dlogn_dlogP_T = idx_dpi_dlogP_T + gas.n_elements
+
+    # construct matrix of elemental stoichiometric coefficients
+    stoich_coeffs = np.zeros((gas.n_elements, gas.n_species))
+    for i, elem in enumerate(gas.element_names):
+        for j, sp in enumerate(gas.species_names):
+            stoich_coeffs[i,j] = gas.n_atoms(sp, elem)
+
+    # equations for derivatives with respect to temperature
+    # first n_elements equations
+    for k in range(gas.n_elements):
+        for i in range(gas.n_elements):
+            coeff_matrix[k,i] = np.sum(stoich_coeffs[k,:] * stoich_coeffs[i,:] * moles)
+        coeff_matrix[k, gas.n_elements] = np.sum(stoich_coeffs[k,:] * moles)
+        right_hand_side[k] = -np.sum(stoich_coeffs[k,:] * moles * gas.standard_enthalpies_RT)
+
+    # skip equation relevant to condensed species
+
+    for i in range(gas.n_elements):
+        coeff_matrix[gas.n_elements, i] = np.sum(stoich_coeffs[i, :] * moles)
+    right_hand_side[gas.n_elements] = -np.sum(moles * gas.standard_enthalpies_RT)
+
+    # equations for derivatives with respect to pressure
+
+    for k in range(gas.n_elements):
+        for i in range(gas.n_elements):
+            coeff_matrix[gas.n_elements+1+k,gas.n_elements+1+i] = np.sum(stoich_coeffs[k,:] * stoich_coeffs[i,:] * moles)
+        coeff_matrix[gas.n_elements+1+k, 2*gas.n_elements+1] = np.sum(stoich_coeffs[k,:] * moles)
+        right_hand_side[gas.n_elements+1+k] = np.sum(stoich_coeffs[k,:] * moles)
+
+    for i in range(gas.n_elements):
+        coeff_matrix[2*gas.n_elements+1, gas.n_elements+1+i] = np.sum(stoich_coeffs[i, :] * moles)
+    right_hand_side[2*gas.n_elements+1] = np.sum(moles)
+    
+    derivs = np.linalg.solve(coeff_matrix, right_hand_side)
+
+    dpi_dlogT_P = derivs[idx_dpi_dlogT_P : idx_dpi_dlogT_P + gas.n_elements]
+    dlogn_dlogT_P = derivs[idx_dlogn_dlogT_P]
+    dpi_dlogP_T = derivs[idx_dpi_dlogP_T]
+    dlogn_dlogP_T = derivs[idx_dlogn_dlogP_T]
+
+    # dpi_dlogP_T is not used
+    
+    return dpi_dlogT_P, dlogn_dlogT_P, dlogn_dlogP_T
+
+def get_thermo_properties(gas, dpi_dlogT_P, dlogn_dlogT_P, dlogn_dlogP_T):
+    '''Calculates specific heats, volume derivatives, and specific heat ratio.
+    
+    Based on shifting equilibrium for mixtures.
+    '''
+    
+    tot_moles = 1.0 / gas.mean_molecular_weight
+    moles = gas.X * tot_moles
+    
+    # construct matrix of elemental stoichiometric coefficients
+    stoich_coeffs = np.zeros((gas.n_elements, gas.n_species))
+    for i, elem in enumerate(gas.element_names):
+        for j, sp in enumerate(gas.species_names):
+            stoich_coeffs[i,j] = gas.n_atoms(sp, elem)
+    
+    spec_heat_p = ct.gas_constant * (
+        np.sum([dpi_dlogT_P[i] * 
+                np.sum(stoich_coeffs[i,:] * moles * gas.standard_enthalpies_RT) 
+                for i in range(gas.n_elements)
+                ]) +
+        np.sum(moles * gas.standard_enthalpies_RT) * dlogn_dlogT_P +
+        np.sum(moles * gas.standard_cp_R) +
+        np.sum(moles * gas.standard_enthalpies_RT**2)
+        )
+    
+    dlogV_dlogT_P = 1 + dlogn_dlogT_P
+    dlogV_dlogP_T = -1 + dlogn_dlogP_T
+    
+    spec_heat_v = (
+        spec_heat_p + gas.P * gas.v / gas.T * dlogV_dlogT_P**2 / dlogV_dlogP_T
+        )
+
+    gamma = spec_heat_p / spec_heat_v
+    gamma_s = -gamma/dlogV_dlogP_T
+    
+    return dlogV_dlogT_P, dlogV_dlogP_T, spec_heat_p, gamma_s
+
+def calculate_c_star(gamma, temperature, molecular_weight):
+    return (
+        np.sqrt(ct.gas_constant * temperature / (molecular_weight * gamma)) *
+        np.power(2 / (gamma + 1), -(gamma + 1) / (2*(gamma - 1)))
+        )
+
+def save_output_files_cantera(df_output, filename, s_name):
+    # Get species names and corresponding mass fractions
+    species = df_output.species_names
+    value = df_output.Y
+    df_emissions = pd.DataFrame(0, index=[0], columns=species)
+
+    temperature = df_output.T
+    pressure = df_output.P
+    density = df_output.density
+    df_emissions['Temperature'] = temperature
+    df_emissions['Pressure'] = pressure 
+    df_emissions['Density'] = density
+
+    # Loop through each species in the filtered DataFrame
+    for species, value in zip(species, value):
+        if value > threshold:
+            df_emissions[species] = value
+        else:
+            # Only set to None if the column already exists
+            if species in df_emissions.columns:
+                df_emissions[species] = None
+
+    # Save .txt file
+    base_name_txt = filename + "_" + s_name
+    new_filename_txt, file_path_txt = data_processing.get_unique_filename(base_name_txt, output_data_folder_path_raw, ".txt")
+    with open(file_path_txt, "w") as txt_file:
+        txt_file.write(df_emissions.to_string())
+    shutil.move(file_path_txt, os.path.join(output_data_folder_path_raw, new_filename_txt))
+
+    # Save .xlsx file
+    base_name_excel = filename + "_" + s_name
+    new_filename_excel, file_path_excel = data_processing.get_unique_filename(base_name_excel, output_data_folder_path_excel, ".xlsx")
+    with pd.ExcelWriter(file_path_excel, engine='openpyxl') as writer:
+        df_emissions.to_excel(writer, sheet_name=new_filename_excel)
+
+    shutil.move(file_path_excel, os.path.join(output_data_folder_path_excel, new_filename_excel))
+
+#endregion
+
 #region: Main Functions
 #### Emission Factors - Main Function
 def emission_factors(df_trajectory_results_cleaned, df_phases, df_emission_factors, scenario_name):
@@ -746,7 +756,7 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_emission_facto
         # 1. Inits
         # Ensure 'altitude_interval' is parsed as a list of floats
         df_emission_factors['altitude_interval'] = df_emission_factors['altitude_interval'].apply(
-            lambda x: [float(i) for i in literal_eval(x)] if isinstance(x, str) else x
+            lambda x: [float(i) for i in ast.literal_eval(x)] if isinstance(x, str) else x
         )
         # Copy cleaned ODE Results
         emission_results = df_trajectory_results_cleaned
@@ -864,65 +874,246 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_eng
         init_directory()
         emission_results = df_trajectory_results_cleaned
         df_engines = create_engine_df(df_phases, df_launch_vehicles_engines)
+        if "p_chamber" in df_engines.columns:
+            loc = df_engines.columns.get_loc("p_chamber")
+            df_engines = df_engines.iloc[:, :loc+1]
+        else:
+            print("Spalte 'p_chamber' nicht gefunden.")
         print(colors.BOLD + colors.BLUE + "Calculating Emissions using Cantera..." + colors.END)
 
         # 2. Rocket Problem - Engines
         # 2.1 Run Cantera Rocket solver for every Engine (Booster or Stage)
         for idx, row in df_engines.iterrows():
-            # Unique filenames for directory management
+            #Input data
             filename = scenario_name + "_" + row["engine"]
+            engine_case = row["engine"]
             s_name = row["phase"] + "_rocket"
-            fuel = row['fuel'][0].replace('(L)', '').strip()
-            oxidizer = row['fuel'][1].replace('(L)', '').strip()
+            fuel = row['fuel'][0].strip()
+            ct_species = os.path.join(input_data_folder_path, file_name_ct_species)
+            oxidizer = row['fuel'][1].strip()
             fuel_mf = row['fuel_mf'][0]
             oxidizer_mf = row['fuel_mf'][1]
-            fuel_temp = row['fuel_temp'][0]
-            oxidizer_temp = row['fuel_temp'][1]
-            equivalence_ratio =  oxidizer_mf/fuel_mf
+            fuel_temp = float(row['fuel_temp'][0])
+            oxidizer_temp = float(row['fuel_temp'][1])
+            fuel_name = species_to_phase[fuel]
+            oxidizer_name = species_to_phase[oxidizer]
             chamber_pressure = row['p_chamber'] * 1e5
-            fuel_temp = oxidizer_temp = reaction_temp = 3000 # Impact on reaction
-            reactant_enthalpy = calculate_reactant_enthalpy(fuel, oxidizer, equivalence_ratio, fuel_temp, oxidizer_temp, chamber_pressure)
 
-            # Step 1: Combustion chamber
-            combustion_gas = combustion_chamber(fuel, oxidizer, equivalence_ratio, chamber_pressure, reactant_enthalpy)
-            d_exit = row['d_exit']
-            exit_area = (row['d_exit'])**2*(1/4)*np.pi
-            throat_area = exit_area/(row['Ae/At'])
+            # Creating Cantera Solutions for fuel and oxidizer
+            fuel = ct.Solution(ct_species, fuel_name)
+            #fuel()
+            fuel.TP = (fuel_temp, chamber_pressure)
+            oxidizer = ct.Solution(ct_species, oxidizer_name)
+            #oxidizer()
+            oxidizer.TP = (oxidizer_temp, chamber_pressure)
 
-            # Step 2: Nozzle expansion
-            df_output = nozzle_expansion(combustion_gas, throat_area, exit_area)
-            exit_temperature = df_output['Exit']['Temperature']
-            exit_pressure = df_output['Exit']['Pressure'] 
+            # Defining mixture ratios
+            o_f_ratio = oxidizer_mf / fuel_mf
+            molar_ratio = o_f_ratio / (oxidizer.mean_molecular_weight / fuel.mean_molecular_weight)
+            moles_ox = molar_ratio / (1 + molar_ratio)
+            moles_fuel = 1 - moles_ox
 
-            # Fix key capitalization for emissions
-            emissions = df_output.get('Emissions', {})
-
-            # Add exit pressure and exit temperature to df_engines
-            df_engines.loc[idx, 'exit_pressure'] = exit_pressure
-            df_engines.loc[idx, 'exit_temperature'] = exit_temperature
+            # Creating Cantera Mixture of reactants and gas phase
+            phase_name = phases_to_phase.get(fuel_name, "unknown")
+            gas2 = ct.Solution(ct_species, phase_name)
             
-            # Filter df_output and add species exit massfractions to df_engines
-            df_species_filtered = emissions
+            mix = ct.Mixture([(fuel, moles_fuel), (oxidizer, moles_ox), (gas2, 0)])
+
+            # Combustion chamber burning
+            mix.equilibrate('HP')
+
+            """
+            print('----------------------------------------------\n')
+            print('Chamber solution:\n')
+            gas2()
+            """
+
+            derivs = get_thermo_derivatives(gas2)
+
+            dlogV_dlogT_P, dlogV_dlogP_T, cp, gamma_s = get_thermo_properties(
+                gas2, derivs[0], derivs[1], derivs[2]
+                )
+
+            #print(f'Cp = {cp: .2f} J/(K kg)')
+
+            #print(f'(d log V/d log P)_T = {dlogV_dlogP_T: .4f}')
+            #print(f'(d log V/d log T)_P = {dlogV_dlogT_P: .4f}')
+
+            #print(f'gamma_s = {gamma_s: .4f}')
+
+            speed_sound = np.sqrt(ct.gas_constant * gas2.T * gamma_s / gas2.mean_molecular_weight)
+            #print(f'Speed of sound = {speed_sound: .1f} m/s')
+
+            entropy_chamber = gas2.s
+            enthalpy_chamber = gas2.enthalpy_mass
+            mole_fractions_chamber = gas2.X
+            gamma_chamber = gamma_s
+
+            c_star = calculate_c_star(gamma_chamber, gas2.T, gas2.mean_molecular_weight)
+            #print(f'c-star: {c_star: .1f} m/s')
+            
+            #######################
+            # Throat Calculation
+            #######################
+            gas_throat = ct.Solution(ct_species, phase_name)
+
+            pressure_throat = chamber_pressure / np.power(
+                (gamma_chamber + 1) / 2., gamma_chamber / (gamma_chamber - 1)
+                )
+            
+            # based on CEA defaults
+            max_iter_throat = 5
+            tolerance_throat = 0.4e-4
+
+            #print('Throat iterations:')
+            mach = 1.0
+            num_iter = 0
+            residual = 1
+            while residual > tolerance_throat:
+                num_iter += 1
+                if num_iter == max_iter_throat:
+                    break
+                    print(f'Error: more than {max_iter_throat} iterations required for throat calculation')
+                pressure_throat = pressure_throat * (1 + gamma_s * mach**2) / (1 + gamma_s)
+                
+                gas_throat.SPX = entropy_chamber, pressure_throat, mole_fractions_chamber
+                # equilibrate the gas at throat conditions
+                gas_throat.equilibrate('SP')
+
+                derivs = get_thermo_derivatives(gas_throat)
+                dlogV_dlogT_P, dlogV_dlogP_T, cp, gamma_s = get_thermo_properties(
+                    gas_throat, derivs[0], derivs[1], derivs[2]
+                    )
+                
+                velocity = np.sqrt(2 * (enthalpy_chamber - gas_throat.enthalpy_mass))
+                speed_sound = np.sqrt(
+                    ct.gas_constant * gas_throat.T * gamma_s / gas_throat.mean_molecular_weight
+                    )
+                mach = velocity / speed_sound
+
+                residual = np.abs(1.0 - 1/mach**2)
+                #print(f'{num_iter}  {residual: .3e}')
+
+            temperature_throat = gas_throat.T
+            pressure_throat = gas_throat.P
+            gamma_s_throat = gamma_s
+            """
+            print('----------------------------------------------\n')
+            print('Throat solution:\n')
+            gas_throat()
+            """
+            
+            #######################
+            # Exit Calculation
+            #######################
+            area_ratio = row['Ae/At']
+            # this is constant
+            A_mdot_thr = gas_throat.T / (gas_throat.P * velocity * gas_throat.mean_molecular_weight)
+
+            gas_exit = ct.Solution(ct_species, phase_name)
+            gas_exit.SPX = gas_throat.s, gas_throat.P, gas_throat.X
+
+            # initial estimate for pressure ratio
+            pinf_pe = np.exp(gamma_s_throat + 1.4 * np.log(area_ratio))
+            p_exit = chamber_pressure / pinf_pe
+
+            gas_exit.SP = entropy_chamber, p_exit
+            # equilibrate the gas at exit conditions
+            gas_exit.equilibrate('SP')
+
+            Ae_At = gas_exit.T / (gas_exit.P * velocity * gas_exit.mean_molecular_weight) / A_mdot_thr
+
+            #print('Iter  T_exit   Ae/At    P_exit     P_inf/P')
+            num_iter = 0
+            #print(f'{num_iter}  {gas_exit.T:.3f} K   {Ae_At: .2f}  {gas_exit.P/1e5:.3f} bar  {pinf_pe:.3f}')
+
+            max_iter_exit = 10
+            tolerance_exit = 4e-5
+
+            residual = 1
+            while np.abs(residual) > tolerance_exit:
+                num_iter += 1
+                
+                if num_iter == max_iter_throat:
+                    print(f'Error: more than {max_iter_exit} iterations required for exit calculation')
+                    break
+                    
+                derivs = get_thermo_derivatives(gas_exit)
+                dlogV_dlogT_P, dlogV_dlogP_T, cp, gamma_s = get_thermo_properties(
+                    gas_exit, derivs[0], derivs[1], derivs[2]
+                    )
+                velocity = np.sqrt(2 * (enthalpy_chamber - gas_exit.enthalpy_mass))
+                speed_sound = np.sqrt(ct.gas_constant * gas_exit.T * gamma_s / gas_exit.mean_molecular_weight)
+
+                Ae_At = gas_exit.T / (gas_exit.P * velocity * gas_exit.mean_molecular_weight) / A_mdot_thr
+
+                dlogp_dlogA = gamma_s * velocity**2 / (velocity**2 - speed_sound**2)
+                residual = dlogp_dlogA * (np.log(area_ratio) - np.log(Ae_At))
+                log_pinf_pe = np.log(pinf_pe) + residual
+
+                pinf_pe = np.exp(log_pinf_pe)
+                p_exit = chamber_pressure / pinf_pe
+
+                gas_exit.SP = entropy_chamber, p_exit
+                gas_exit.equilibrate('SP')
+                
+                #print(f'{num_iter}  {gas_exit.T:.3f} K  {Ae_At: 7.3f}  {gas_exit.P/1e5:.3f} bar  {pinf_pe:.3f}')
+
+            #print(f'Exit temperature: {gas_exit.T: .2f} K')
+            #print(f'Exit pressure: {gas_exit.P: .2f} Pa')
+
+            derivs = get_thermo_derivatives(gas_exit)
+            dlogV_dlogT_P, dlogV_dlogP_T, cp, gamma_s = get_thermo_properties(
+                gas_exit, derivs[0], derivs[1], derivs[2]
+                )
+            velocity = np.sqrt(2 * (enthalpy_chamber - gas_exit.enthalpy_mass))
+
+            thrust_coeff = velocity / c_star
+            #print(f'Thrust coefficient: {thrust_coeff: .4f}')
+
+            g0 = 9.80665
+            Isp = velocity
+            Ivac = Isp + gas_exit.T * ct.gas_constant / (velocity * gas_exit.mean_molecular_weight)
+            #print(f'I_sp = {Isp: .1f} m/s')
+            #print(f'I_vac = {Ivac: .1f} m/s')
+
+            #print('Actual specific impulse:')
+            #print(f'I_sp = {Isp / g0: .1f} s')
+            #print(f'I_vac = {Ivac / g0: .1f} s')
+            """
+            print('----------------------------------------------\n')
+            print('Exit solution:\n')
+            gas_exit()
+            """
+
+            exit_pressure = gas_exit.P / 1e5 
+            exit_temperature = gas_exit.T
+
+            if "exit_pressure" not in df_engines.columns:
+                df_engines["exit_pressure"] = pd.NA
+
+            if "exit_temperature" not in df_engines.columns:
+                df_engines["exit_temperature"] = pd.NA
+
+            # Werte in Zeile mit Index 0 setzen
+            df_engines.at[idx, "exit_pressure"] = exit_pressure
+            df_engines.at[idx, "exit_temperature"] = exit_temperature
+            
+            # Get species names and corresponding mass fractions
+            species = gas_exit.species_names
+            value = gas_exit.Y
+
             # Loop through each species in the filtered DataFrame
-            for species, value in df_species_filtered.items():
+            for species, value in zip(species, value):
                 if value > threshold:
-                    # Update the DataFrame with the value if it exceeds the threshold
                     df_engines.loc[idx, species] = value
                 else:
-                    # Set species value to None if below threshold
+                    # Only set to None if the column already exists
                     if species in df_engines.columns:
                         df_engines.loc[idx, species] = None
 
-            # Update general nozzle exit conditions
-            exit_conditions = df_species_filtered.get('Exit', {})
-            for key, value in exit_conditions.items():
-                if key in df_engines.columns:
-                    df_engines.loc[idx, key] = value
-
             # Saving raw and formated data
-            save_files(filename, s_name)
-            clean_directory(filename)
-            #save_results_excel(filename, s_name, df_output)
+            save_output_files_cantera(gas_exit, filename, s_name)
         
         # 2.2 Save Results at Exit for all Engines to Excel and copy original data for subsequent Afterburning Calculations
         df_engines = df_engines.fillna(0)
@@ -962,82 +1153,86 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_eng
 
                     # Including Afterburning calculation if required
                     if afterburning:
-                        # 01. Get required Data for NASA CEA Calculation
+                        # 01. Get required Data for afterburning Calculation
                         # 01.1 Athmospheric Data:
-                            # at current position (from row, either average or last specified in config)
+                        #print('Calculating Afterburning for phase:', phase, 'engine:', engine, 'interval_fuel_mass:', interval_fuel_mass)
                         rho_atm, t_atm, p_atm, df_air_massfractions = data_processing.calculate_atmosphere_data(row)
+                        atmosphere = ct.Solution(ct_species, 'air_gas')
+                        atmosphere.TPY = t_atm, p_atm, df_air_massfractions.iloc[0].to_dict()
+                        #atmosphere()
                         dia = df_launch_vehicles['d'].iloc[0]
                         massflow, mdot, dmdot = trajectory.calculate_massflow(current_phase)
                         v_rocket = row["v"]
-                        rof_ab = rof_ab_calc(rof_f, dia, massflow, rho_atm, v_rocket)
-
+                        altitude = row['h']
+                        rof_ab = rof_ab_calc(x_ab, dia, massflow, rho_atm, v_rocket)
                         # 01.2 Exhaust data:
-                            # at exit from first engine rocket problem NASA CEA calculation (2.1)
-                            # Access the original exit data of current "phase, engine pair" from df_engines_original_data
+                        df_propellant_data = df_engines_original_data.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), ['fuel','exit_pressure', 'exit_temperature']]
                         df_fuel_massfractions = df_engines_original_data.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines_original_data.columns[df_engines_original_data.columns.get_loc('exit_temperature')+1:]]
-                                               
-                        # Remove the unnecessary species from the dataset
-                        for species in df_fuel_massfractions.columns:
-                            # Get the value of the species
-                            value = df_fuel_massfractions[species].values[0]
-                            
-                            # Check if the value is below or equal to the threshold
-                            if value <= threshold:
-                                # Drop the species column if the value is below or equal to the threshold
-                                df_fuel_massfractions.drop(columns=[species], inplace=True)
-
-                        fuel_exit_temperature = df_engines_original_data.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), 'exit_temperature'].values[0]
+                        propellant_list = df_propellant_data['fuel'].iloc[0]
+                        propellant = propellant_list[0]
+                        t_exit = df_propellant_data['exit_temperature'].iloc[0]
+                        fuel_name = species_to_phase[propellant]
+                        phase_name = phases_to_phase.get(fuel_name, "unknown")
+                        exhaust = ct.Solution(ct_species, phase_name)
+                        exhaust.TPY = t_exit, p_atm, df_fuel_massfractions.iloc[0].to_dict()
+                        #exhaust()
                         
                         # 01.3 Problem Type Data:
                         t_ab = t_atm
-                        p_ab = p_atm*1e-5
+                        p_ab = p_atm
                         rho_ab = rho_atm
                         s_ab = None
-                        t_fuel = fuel_exit_temperature
+                        t_fuel = t_exit
                         t_air = t_atm
-
                         # 02. Cantera Afterburning Calculation of Exhaust and Atmosphere for current "phase, engine pair"
                         afterburning_filename = scenario_name + "_" + str(interval_start)
                         s_name = phase + "_" + engine + "_afterburning"
-                        exit_gas = emissions
-                        ambient_gas = df_air_massfractions
-                        df_output = atmosphere_mixing(t_ab, p_ab, rho_ab, s_ab, t_fuel, t_air, exit_gas, ambient_gas, rof_ab)
-                        species_mapping = {
-                            '*N2': 'N2', '*O2': 'O2', '*O': 'O', '*He': 'He',
-                            '*H': 'H', '*Ar': 'Ar', '*N': 'N', '*NO': 'NO'
-                        }
-                        
-                        # Convert DataFrame species names using mapping
-                        ambient_mass_fractions = {
-                            species_mapping.get(species, species): value
-                            for species, value in df_air_massfractions.iloc[0].items()
-                            if species_mapping.get(species, species) in ct.Solution('gri30.yaml').species_names
-                        }
-                        new_total_mass_fraction = sum(ambient_mass_fractions.values())
-
-                        # Normalize mass fractions so they sum to 1
-                        if new_total_mass_fraction > 0:
-                            normalized_air_mass_fractions = {
-                                species: value / new_total_mass_fraction
-                                for species, value in ambient_mass_fractions.items()
-                            }
+                        #print('alt',altitude)
+                        #print('rof_ab',rof_ab)
+                        molar_ratio_ab = rof_ab * (exhaust.mean_molecular_weight / atmosphere.mean_molecular_weight)
+                        #print('molar_ratio_ab',molar_ratio_ab)
+                        moles_atmosphere = molar_ratio_ab / (1 + molar_ratio_ab)
+                        #print('moles_atmosphere',moles_atmosphere)
+                        moles_exhaust = 1 / (1 + molar_ratio_ab)
+                        #print('moles_exhaust',moles_exhaust)
+                        emission = ct.Solution(ct_species, 'rocket_emission')
+                        if rof_ab >= 0.01 and rof_ab < x_ab * 5:
+                            mix_ab = ct.Mixture([(exhaust, moles_exhaust), (atmosphere, moles_atmosphere), (emission, 0)])
+                            try:
+                                mix_ab.equilibrate('HP', max_iter=2000)
+                            except Exception as e:
+                                print('Error during Cantera afterburning equilibrate:', e)
                         else:
-                            normalized_air_mass_fractions = ambient_mass_fractions  # Avoid division by zero
-                        # Saving raw and formated data
-                        save_output_files_cantera(df_output, afterburning_filename, s_name)
-                        # 03. Update df_engines with the results
-                        # 03.1 Set all species mass fractions to zero for the current phase and engine pair
-                        df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0
-                        # 03.2 Process df_output (which is a dictionary): Convert it to a DataFrame and drop the first 6 rows
-                        df_output_filtered = pd.DataFrame.from_dict(df_output['Emissions'], orient='index', columns=['afterburning_emissions'])
-                        
-                        # 03.3 Transpose df_air_massfractions and adjust column names
+                            print('Afterburning skipped due to low rof_ab:', rof_ab)
+                            emission = exhaust
 
-                        df_air_massfractions = pd.DataFrame.from_dict(normalized_air_mass_fractions, orient='index', columns=['air_massfractions'])
+                        """
+                        print('Afterburning equilibrate done')
+                        print('----------------------------------------------\n')
+                        print('Exhaust solution:\n')
+                        emission()
+                        """
                         
-                        # 03.4 Combine the dataframes
-                        combined_df = pd.concat([df_output_filtered, df_air_massfractions], axis=1, join='outer').fillna(0)
+                        # Get species names and corresponding mass fractions
+                        species = emission.species_names
+                        value = emission.Y
+                        df_air_massfractions = df_air_massfractions.T
+                        df_air_massfractions.columns = ['air_massfractions']
+                        # Loop through each species in the filtered DataFrame
+                        df_emissions = pd.DataFrame(0, index=species, columns=['afterburning_emissions'])
+                        for species, value in zip(species, value):
+                            if value > threshold > 0:
+                                df_emissions.loc[species, 'afterburning_emissions'] = value
+                            else:
+                                # Only set to None if the column already exists
+                                if species in df_emissions.columns:
+                                    df_emissions.loc[species, 'afterburning_emissions'] = None
                         
+                        # Saving data
+                        save_output_files_cantera(gas_exit, afterburning_filename, s_name)
+                        
+                        # Prepare DataFrame for Afterburning Emission Index Calculation
+                        combined_df = df_emissions.join(df_air_massfractions, how='outer').fillna(0)
                         # Loop through the combined_df to calculate the emission index for each species
                         for species, row2 in combined_df.iterrows():
                             x_species = row2['afterburning_emissions']
@@ -1047,17 +1242,13 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_eng
                             # Update the species mass fraction in df_engines if the value is above the threshold
                             if EI_species > threshold:
                                 df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), species] = EI_species     
-
                         # Fill NaN to avoid errors in the following calculations
                         df_engines = df_engines.fillna(0)
                     # Get mass fractions for the specific "phase and engine pair" from df_engines
-                        # These are the precalculated data from the first Nasa CEA Calculation of the engines
-                        # Alternativly its data from the Afterburning overwrite
                     df_mass_fractions = df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature')+1:]] # The species start at exit_temperature + 1
-                    
+
                     # Update Black Carbon Primary to Final Emission Index
                     if calculate_black_carbon:
-                        
                         # Determine if the engine is a booster or stage engine
                         if engine == current_phase['booster_engine']:
                             current_fuel_type = current_phase['booster_fuel']
@@ -1068,6 +1259,7 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_eng
                         
                         # Transform the fuel type list into a single string with slashes
                         current_fuel_type_str = "/".join(current_fuel_type)
+
                         # Filter the dataframe to get the corresponding emission factors
                         df_emission_factor_fuel = df_emission_factors.loc[
                             (df_emission_factors['fuel'] == current_fuel_type_str) & 
@@ -1080,7 +1272,7 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_eng
                         else:
                             primary_ei_bc = 0.0
                             raise ValueError(f"No matching 'BC_prime' data found for fuel: {current_fuel_type_str} and method: {emission_factor_method}")
-                        
+
                         final_ei_bc = black_carbon(row["h"], primary_ei_bc)
                         
                         # Include the BC Final Emission Index to df_mass_fractions
@@ -1134,12 +1326,28 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_en
             filename = scenario_name + "_" + row["engine"]
             s_name = row["phase"] + "_rocket"
             problem = "rocket"
-
             # Creat .inp file, run NASA CEA & read results
             create_inp_file(problem, filename, rocket_case, df=row)
             subprocess.run(["echo", filename, "|", nasa_cea_folder_path + nasa_cea_exe], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             df_output = readCEA(problem, filename, rocket_case)
             
+            # Saving raw and formated data
+            save_files(filename, s_name, rocket_case)
+            clean_directory(filename)
+            save_results_excel(filename, s_name, df_output, rocket_case)
+            
+            if df_engines.loc[idx, 'engine_cycle'] == 'GG':
+                filename = scenario_name + "_" + row["engine"] + "_OC"
+                s_name = row["phase"] + "_rocket" + "_OC"
+                problem = "rocket_oc"
+                create_inp_file(problem, filename, rocket_case, df=row)
+                subprocess.run(["echo", filename, "|", nasa_cea_folder_path + nasa_cea_exe], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                df_output_gg = readCEA(problem, filename, rocket_case)
+                # Saving raw and formated data
+                save_files(filename, s_name, rocket_case)
+                clean_directory(filename)
+                save_results_excel(filename, s_name, df_output_gg, rocket_case)
+
             # Add exit pressure and exit temperature to df_engines
             exit_pressure = df_output.loc['p', 'exit']
             exit_density = df_output.loc['rho', 'exit']
@@ -1147,34 +1355,56 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_en
             df_engines.loc[idx, 'exit_pressure'] = exit_pressure
             df_engines.loc[idx, 'exit_density'] = exit_density
             df_engines.loc[idx, 'exit_temperature'] = exit_temperature
-            
             # Filter df_output and add species exit massfractions to df_engines
-            df_species_filtered = df_output.iloc[6:, 2:].transpose()
-            # Loop through each species in the filtered DataFrame
-            for species in df_species_filtered.columns:
-                # Get the value of the species
-                value = df_species_filtered.loc["exit", species]
-                
-                # Check if the value is above the threshold
-                if value > threshold:
-                    # If the value is above the threshold, add it to df_engines
-                    df_engines.loc[idx, species] = value
-                else:
-                    # If the value is below or equal to the threshold, remove the species column from df_engines
-                    if species in df_engines.columns:
-                        df_engines.loc[idx, species] = None
-                        #df_engines.drop(columns=[species], inplace=True)
 
-            # Saving raw and formated data
-            save_files(filename, s_name, rocket_case)
-            #clean_directory(filename)
-            save_results_excel(filename, s_name, df_output, rocket_case)
-        
+            if df_engines.loc[idx, 'engine_cycle'] == 'GG':
+                massflow_gg = df_engines.loc[idx,'mf_oc']
+
+                # Get exit species mass fractions from both dataframes
+                species_output = df_output.iloc[6:, 2]  # 'exit' column
+                species_gg = df_output_gg.iloc[6:, 2]   # 'exit' column
+                # Ensure both Series have the same index (union of species from both)
+                all_species = species_output.index.union(species_gg.index)
+
+                # Reindex both to the full list, filling missing with 0
+                species_output = species_output.reindex(all_species).fillna(0)
+                species_gg = species_gg.reindex(all_species).fillna(0)
+
+                # Weighted combination of species exit values
+                combined_species = (
+                    species_output.fillna(0) * (1 - massflow_gg) +
+                    species_gg.fillna(0) * massflow_gg
+                )
+
+                # Filter species based on threshold and update df_engines
+                for species, value in combined_species.items():
+                    if value > threshold:
+                        df_engines.loc[idx, species] = value
+                    else:
+                        if species in df_engines.columns:
+                            df_engines.loc[idx, species] = None
+
+            else:
+                df_species_filtered = df_output.iloc[6:, 2:].transpose()
+                # Loop through each species in the filtered DataFrame
+                for species in df_species_filtered.columns:
+                    # Get the value of the species
+                    value = df_species_filtered.loc["exit", species]
+                    
+                    # Check if the value is above the threshold
+                    if value > threshold:
+                        # If the value is above the threshold, add it to df_engines
+                        df_engines.loc[idx, species] = value
+                    else:
+                        # If the value is below or equal to the threshold, remove the species column from df_engines
+                        if species in df_engines.columns:
+                            df_engines.loc[idx, species] = None
+                            #df_engines.drop(columns=[species], inplace=True)
+
         # 2.2 Save Results at Exit for all Engines to Excel and copy original data for subsequent Afterburning Calculations
         df_engines = df_engines.fillna(0)
         save_results_excel(scenario_name, "Rocket_Exit_Results", df_engines, rocket_case)
         df_engines_original_data = df_engines.copy()
-
 
         # 3. Total Emission Calculation
         # Initialize a DataFrame to hold all species emissions for all rows
@@ -1219,7 +1449,7 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_en
                         dia = df_launch_vehicles['d'].iloc[0]
                         massflow, mdot, dmdot = trajectory.calculate_massflow(current_phase)
                         v_rocket = row["v"]
-                        rof_ab = rof_ab_calc(rof_f, dia, massflow, rho_atm, v_rocket)
+                        rof_ab = rof_ab_calc(x_ab, dia, massflow, rho_atm, v_rocket)
                               
                         # 01.2 Exhaust data:
                             # at exit from first engine rocket problem NASA CEA calculation (2.1)
@@ -1263,20 +1493,59 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_launch_vehicles_en
                         
                             # Saving raw and formated data
                             save_files(afterburning_filename, s_name, rocket_case)
-                            #clean_directory(afterburning_filename)
+                            clean_directory(afterburning_filename)
                             save_results_excel(afterburning_filename, s_name, df_output, rocket_case)
                         except Exception as e:
-                            print(f"NASA CEA error: {e} at time {current_phase["time_start"]}s. Setting emissions fractions to 0")
-                            df_output = pd.df_output({
-                                'p': [0],
-                                't': [0],
-                                'mach': [0],
-                                'H': [0],
-                                'rho': [0],
-                                's': [0],
-                                'CO': [0]
+                            time = row['t']
+                            alt = row['h']
+                            print(f"NASA CEA error: {e} at time {time}s and altitude {alt}. Calculating emissions with stoichiometric factors.")
+                            # Filter `df_emission_factors` by fuel type and method
+                            df_emission_factors['altitude_interval'] = df_emission_factors['altitude_interval'].apply(
+                                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+                            )
+                            
+                            df_emission_factor_fuel = df_emission_factors[
+                                (df_emission_factors['fuel'] == current_fuel_type_str) &
+                                (df_emission_factors['method'] == emission_factor_method)
+                            ]
+
+                            altitude_interval_match = df_emission_factor_fuel[
+                                df_emission_factor_fuel['altitude_interval'].apply(
+                                    lambda x: isinstance(x, list) and len(x) == 2 and x[0] <= alt <= x[1]
+                                )
+                            ]
+                            # Skip if no matching altitude interval
+                            if altitude_interval_match.empty:
+                                print(f"No matching emission factors for altitude {alt}")
+                                continue
+                            emission_factors_row = altitude_interval_match.iloc[0]
+                            df_emission_factor_fuel = emission_factors_row.copy()
+                            
+                            # Filter to keep only numeric columns for multiplication
+                            df_emission_factor_fuel_numeric = df_emission_factor_fuel.drop(['fuel', 'method', 'altitude_interval','BC_prim']).astype(float)
+ 
+                            # Create base emission factor Series from row
+                            df_output = df_emission_factor_fuel_numeric.copy()
+
+                            # Convert Series to DataFrame with the correct structure:
+                            # Species (including CO2, NOx, etc.) as index, values under 'exit' column
+                            df_output = df_output.to_frame(name='exit')
+
+                            # Add standard thermodynamic fields at the top with 0.0 values
+                            standard_fields = pd.DataFrame({
+                                'exit': {
+                                    'p': 0.0,
+                                    't': 0.0,
+                                    'mach': 0.0,
+                                    'H': 0.0,
+                                    'rho': 0.0,
+                                    's': 0.0
+                                }
                             })
-                        
+
+                            # Concatenate thermodynamic + emission species vertically
+                            df_output = pd.concat([standard_fields, df_output])
+
                         # 03. Update df_engines with the results
                         # 03.1 Set all species mass fractions to zero for the current phase and engine pair
                         df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0

@@ -20,7 +20,7 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     
     # Gleichung nach Fleeman, siehe Dokumentation
     if ma<1 and v!= 0:
-        c_w_bf = 0.053*(l/d)*(ma/(0.5*rho*0.0624*(abs(v)*3.2808)**2 * (l*3.2808)))**0.2
+        c_w_bf = 0.053*(l/d)*(abs(ma)/(0.5*rho*0.0624*(abs(v)*3.2808)**2 * (l*3.2808)))**0.2
         c_w_bp = (1-0.556435354)*(0.12+0.13*abs(ma)**2)
         c_w_bw = 0
         c_w = c_w_bf + c_w_bp + c_w_bw
@@ -284,7 +284,7 @@ def trajectory_ODE(t,y,*ode_args):
     d_date = 1                                                  # 1 timestep
     y[7], dlat, y[8], dlon = coordinates(scenario["inclination"], scenario["lat"], scenario["lon"], x)
     y[9], dp, y[10], drho, y[11], dT = calculate_atmosphere_data(date, lon, lat, h)
-
+    #print(f"t: {t:.2f} s, h: {h:.2f} km, v: {v:.2f} m/s, gamma: {np.degrees(gamma):.2f}°")
     return [dv, dx, ds, dh, diff_gamma, dm, d_date , dlat, dlon, dp, drho, dT, dF, dmdot]
 
 # Solving the ODE

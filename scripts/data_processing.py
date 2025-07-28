@@ -47,7 +47,7 @@ def get_input_data():
     try:
         # 1) Import Emission Factors
         df_emission_factors = pd.DataFrame()
-        if use_emission_factors or (use_nasa_cea and calculate_black_carbon) or (use_cantera and calculate_black_carbon):
+        if use_emission_factors or use_nasa_cea or use_cantera:
             ef_path = os.path.join(input_data_folder_path, file_name_emission_factors)
             df_emission_factors = pd.read_excel(ef_path, index_col=None, sheet_name=sheet_name_emission_factors)
             df_emission_factors = df_emission_factors.fillna(0)

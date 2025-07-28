@@ -8,7 +8,7 @@ import os
 # --- Read CSV File ---
 def read_emissions_csv(file_path):
     df = pd.read_csv(file_path)
-    emission_start_index = df.columns.get_loc('time_interval') + 1
+    emission_start_index = df.columns.get_loc('total_sum_species') + 1
     emission_columns = df.columns[emission_start_index:]
     clean_columns = [re.sub(r'\*', '', col).strip() for col in emission_columns]
     df.rename(columns=dict(zip(emission_columns, clean_columns)), inplace=True)
@@ -96,7 +96,7 @@ def save_emissions_summary(df, emissions, save_name):
 
 # --- Main Execution ---
 def main():
-    file_path = 'output_data\emissions\EMIS_2023-010_Starlink5277_Emission_Factors.csv'  # Replace with your CSV file path
+    file_path = 'output_data\emissions\EMIS_2023-013_Starlink5492_NASA_CEA_Equilibrium(1).csv'  # Replace with your CSV file path
     save_name = os.path.splitext(os.path.basename(file_path))[0]  # Extract filename without extension
     df, emission_cols = read_emissions_csv(file_path)
     binned_emissions = aggregate_by_altitude(df, emission_cols)

@@ -8,9 +8,9 @@ import numpy as np
 #### Choose which Scenarios to process ####
 #-------------------------------------
 all_scenarios = False       # When False only the user_defined_scenarios will be processed
-user_defined_scenarios = ["2023-010_Starlink5277"]       #2023-010_Starlink5277      # Based on the scenario name
+user_defined_scenarios = ["2023-013_Starlink5492"]    # Based on the scenario name
 use_external_trajectory_data = True
-file_name_ext_trajectory = 'input_data/trajectory_results_cleaned.csv'
+file_name_ext_trajectory = 'output_data/trajectory/trajectory_2023-013_Starlink5492_input.csv'
 #endregion
 
 #region: #### Trajectory Config ####
@@ -44,13 +44,10 @@ gamma_0 = 90*np.pi/180      # Path angle relative to horizon initially at 90° (
 #### Data Compression ####
 #-------------------------------------
 compress_data = True                # For faster emission calculation time with NASA CEA
-compress_method = "height"            # Choose between "time" or "height" as the compression interval
-#compress_method = "height"
-compress_interval = 1              # Choose interval steps in [s] or [km]
-compress_atmosphere = "averages"    # Choose "averages" to average the atmosphere data of the interval
-#compress_atmosphere = "latest"     # Or choose "latest" for just the value at the given time/height step
+compress_method = "height"          # Choose between "time" or "height" as the compression interval
+compress_interval = 1               # Choose interval steps in [s] or [km]
+compress_atmosphere = "averages"    # Choose "averages" to average the atmosphere data of the interval or choose "latest" for just the value at the given time/height step
 interval_tolerance = 1e-6           # Allow for floating-point precision issues
-
 #endregion
 
 #region: #### Emissions Config ####
@@ -65,7 +62,7 @@ emission_factor_method = "stoichiometric"
 use_nasa_cea = False
 use_cantera = False
 
-# Choose if you want to include Black Carbon in the results
+# Choose if you want to include Black Carbon emission according to James et al. 2021 in the results
 calculate_black_carbon = True
 
 #### Emission Constants ####
@@ -86,18 +83,18 @@ molar_masses = {
 # Avogadro's number
 avogadro_number = 6.02214076e23  # molecules per mole
 
-# Threshold for species to be considered not zero
+# Threshold for species to be considered not zero in emissions calculations
 threshold = 1e-6
 
 
 #### NASA CEA Config ####
 #-------------------------------------
-trace = "1.e-10"
+trace = "1.e-10"                    # Limit for trace species in NASA CEA
 
 # Rocket Problem (Both can be True -> runs twice)
 rocket_equilibrium = True           # Use equilibrium in rocket problem
 rocket_frozen = True                # Use frozen in rocket problem
-frozen_nfz = 2                      # Frozen Factor
+frozen_nfz = 2                      # Point of freezing reactions 1 = Chamber, 2 = Nozzle, 3 = Exit
 
 frozen_nfz_exception_fuels = ["HTPB", "PBAN"]   # Fuels with exception nfz value
 frozen_nfz_exception = 3                        # Exception nfz value
@@ -105,7 +102,7 @@ frozen_nfz_exception = 3                        # Exception nfz value
 # Afterburning
 afterburning = True                 # Include afterburning in results
 problem_afterburning = "hp"         # tp, hp & uv (choose only one)
-rof_f = 4                           # Afterburning diameter factor
+x_ab = 2                            # Afterburning uncertainty factor
 
 # Fuels with specific formula to use instead of data from thermo.lib
 # When the fuel is specified here, this data will always be used instead of the thermo.lib data
@@ -119,6 +116,41 @@ special_fuels = {
             "N": 5     # Nitrogen
         }
     },
+    "BTTN": {
+        "enthalpy": -2175.70,  # Enthalpy in kJ/mol
+        "chemical_formula": {
+            "C": 4,  # Carbon
+            "H": 7,  # Hydrogen
+            "O": 9,   # Oxygen
+            "N": 3     # Nitrogen
+        }
+    },
+    "RDX": {
+        "enthalpy": -5625,  # Enthalpy in kJ/mol
+        "chemical_formula": {
+            "C": 3,  # Carbon
+            "H": 6,  # Hydrogen
+            "O": 6,   # Oxygen
+            "N": 6     # Nitrogen
+        }
+    },
+    "CAB": {
+        "enthalpy": -5625,  # Enthalpy in kJ/mol
+        "chemical_formula": {
+            "C": 6,  # Carbon
+            "H": 12,  # Hydrogen
+            "O": 4   # Oxygen
+        }
+    },
+    "PBAN": {
+        "enthalpy": -4118.79100,  # Enthalpy in kJ/mol
+        "chemical_formula": {
+            "C": 10,  # Carbon
+            "H": 13,  # Hydrogen
+            "O": 2,   # Oxygen
+            "N": 1    # Nitrogen
+        }
+    },
     "OtherFuel": {                # Example Fuel
         "enthalpy": -12345.6789,  # Enthalpy in kJ/mol
         "chemical_formula": {
@@ -129,7 +161,6 @@ special_fuels = {
     }
     # Add more fuels as needed
 }
-
 #endregion
 
 #region: #### Folder Paths, Data Names & Co. ####
@@ -152,9 +183,6 @@ nasa_cea_exe = 'FCEA2.exe'
 file_name_emission_factors = 'emission_factors.xlsx'
 sheet_name_emission_factors = 'Emission_Factors'
 
-# file_name_launch_rates = 'launch_rates.xlsx'
-# sheet_name_launch_rates = 'Startraten'
-
 file_name_scenarios = 'scenarios.xlsx'
 sheet_name_scenarios = 'scenarios'
 
@@ -165,6 +193,7 @@ file_name_launch_vehicle = 'LV_Database.xlsx'
 sheet_name_launch_vehicle = 'LV_Database'
 sheet_name_launch_vehicle_engines = 'Engine'
 
+file_name_ct_species = 'cea_species.yaml'
 
 #### Colors for Terminal Outputs ####
 class colors:
