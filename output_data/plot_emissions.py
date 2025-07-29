@@ -106,7 +106,7 @@ def plot_top5_emissions_per_bin(binned_emissions, save_name):
                bbox_to_anchor=(1.05, 1), loc='upper left', title='Species')
 
     plt.tight_layout()
-    plt.savefig(f"output_data/plots/{save_name}_overlapping_top5_bar.png")
+    plt.savefig(f"output_data/plots/{save_name}_bar_chart.png")
     plt.show()
 
 
@@ -161,7 +161,7 @@ def save_emissions_summary(df, emissions, save_name):
 
 # --- Main Execution ---
 def main():
-    file_path = 'output_data\emissions\EMIS_2023-013_Starlink5492_NASA_CEA_Equilibrium(2).csv'  # Replace with your CSV file path
+    file_path = 'output_data/emissions/EMIS_2023-013_Starlink5492_Emission_Factors.csv'  # Replace with your CSV file path
     save_name = os.path.splitext(os.path.basename(file_path))[0]  # Extract filename without extension
     df, emission_cols = read_emissions_csv(file_path)
     binned_emissions = aggregate_by_altitude(df, emission_cols)
