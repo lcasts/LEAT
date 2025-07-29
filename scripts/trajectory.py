@@ -19,9 +19,10 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     a_r = launch_vehicle['A_R']
     
     # Gleichung nach Fleeman, siehe Dokumentation
-    if ma<1 and v!= 0:
-        c_w_bf = 0.053*(l/d)*(abs(ma)/(0.5*rho*0.0624*(abs(v)*3.2808)**2 * (l*3.2808)))**0.2
-        c_w_bp = (1-0.556435354)*(0.12+0.13*abs(ma)**2)
+    if ma<=1 and v!= 0:
+        q = 0.5*rho*(abs(v))**2
+        c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
+        c_w_bp = (1-(a_r)/(a_r))*(0.12+0.13*abs(ma)**2)
         c_w_bw = 0
         c_w = c_w_bf + c_w_bp + c_w_bw
         #c_w = 0.053*(l/d)*(ma*l/(0.5*rho*v**2))**0.2
@@ -32,10 +33,10 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     elif l_n == 0 and ma>1:
         c_w = 0.4
     else:
-        c_w_bf = 0.053*(l/d)*(ma/(0.5*rho*0.0624*(v*3.2808)**2 * (l*3.2808)))**0.2
-        c_w_bp = (1-0.556435354)*(0.25/ma)
-        c_w_bw = (1.59 + 1.83/(ma**2))*(np.arctan(0.5/(l_n/d_n)))**1.69 * (1-(d_n/d_f)**2) + ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(0.5)))**1.69) * (d_n/d_f)**2
-        #c_w_bw = (1.586 + 1.834/(ma**2))*(np.arctan(0.5/(l_n/d_n)))**1.69 * ((d_f**2-d_n**2)/(d_f**2)) + 0.665 * (1.59 + 1.83/(ma**2)) * (d_n**2)/(d_f**2)
+        q = 0.5*rho*(abs(v))**2
+        c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
+        c_w_bp = (1-(a_r)/(a_r))*(0.25/ma)
+        c_w_bw = ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(l_n/d_n)))**1.69) * (1-(d_n/d_f)**2) + ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(0.5)))**1.69) * (d_n/d_f)**2
         c_w = c_w_bf + c_w_bp + c_w_bw
     return c_w
 
@@ -124,7 +125,8 @@ def get_phases(t, max_step, phases, phase_intervals):
     
     return phase_changed, current_phase, prev_phase
 
-def calculate_force(current_phase, pressure_ratio, h, scenario):
+def calculate_force(current_phase, pressure_ratio, h, scenario, t):
+    # Check if current phase is None
     if current_phase is None:
         F = 0
         force_reduced = False 
@@ -136,6 +138,9 @@ def calculate_force(current_phase, pressure_ratio, h, scenario):
     stage_force_sl = current_phase["stage_force_sl"]
     stage_force_vac = current_phase["stage_force_vac"]
     
+    force_sl = 0
+    force_vac = 0
+
     # Sea Level & Vacuum Forces depending on current phase (With ot without booster)
     # Only Stage Force available
     if np.isnan(booster_force_sl) or np.isnan(booster_force_vac):
@@ -162,13 +167,40 @@ def calculate_force(current_phase, pressure_ratio, h, scenario):
     
     # Differential not necessary when simply overwriting data
     dF = 0
-    
+   
+    #"""
+    if scenario["launch_vehicle"] == "Ariane_62" and not np.isnan(booster_force_vac):
+        # Ariane 62 booster uses time-dependent thrust from P120 curve
+        p120_time = np.array([ 0, 5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70,
+        74, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 121.2, 125, 130, 138])
+        p120_thrust = np.array([3100, 3474.71, 3577.87, 3580.89, 3523.48, 3306.06, 2940.45, 2627.77, 2439,
+        2523, 2622, 2725, 2823, 2894, 2964, 3000, 3024.6, 3009, 2891, 2642,
+        2341.24, 2085.13, 1885.76, 1739.57, 1591.45, 1491.6, 1397.24, 1375, 715, 97, 0])
+
+        # Normalize by maximum thrust to get percentage profile
+        p120_thrust_pct = p120_thrust / np.max(p120_thrust)
+        p120_curve = interp1d(p120_time, p120_thrust_pct, bounds_error=False, fill_value=0)
+
+        # Calculate thrust percent based on time
+        if t > 0 and t <= 138:
+            booster_thrust_pct = p120_curve(t)
+        else:
+            booster_thrust_pct = 0
+
+        force_sl = stage_force_sl
+        force_vac = stage_force_vac
+        F = force_sl + (force_vac - force_sl) * (1 - pressure_ratio)
+        if scenario["h_fr_start"] <= h <= scenario["h_fr_end"]:
+            # Apply force reduction for Max-Q
+            F *= scenario["force_reduced"]
+            force_reduced = True
+        F = F + booster_thrust_pct * booster_force_vac
+    #"""
     return F, F, dF
 
-def calculate_massflow(current_phase):
+def calculate_massflow(current_phase, h, scenario):
     if current_phase is None:
-        massflow = 0
-        return massflow
+        return 0,0,0
     
     # Time Intervall of current phase
     time_interval = current_phase["time_end"] - current_phase["time_start"]
@@ -187,6 +219,10 @@ def calculate_massflow(current_phase):
     
     # Calculate the mass flow rate
     massflow = total_fuel_mass / time_interval
+
+    if scenario["h_fr_start"] <= h <= scenario["h_fr_end"]:
+        # Apply massflow reduction for thrust reduction
+        massflow *= scenario["force_reduced"]
     
     mdot = massflow * max_step
     dmdot = 0
@@ -263,12 +299,12 @@ def trajectory_ODE(t,y,*ode_args):
     c_w = drag_coefficient(temp, v, rho, launch_vehicle)
     F_W = drag_force(c_w, rho, v, launch_vehicle)
     pressure_ratio = p_a / p_0
-    F, y[12], dF = calculate_force(current_phase, pressure_ratio, h, scenario)
+    F, y[12], dF = calculate_force(current_phase, pressure_ratio, h, scenario, t)
     if t == 0:
         massflow = y[13]  # Use the initial value passed in y
         dmdot = 0         # No derivative at t=0
     else:
-        massflow, y[13], dmdot = calculate_massflow(current_phase)
+        massflow, y[13], dmdot = calculate_massflow(current_phase, h, scenario)
     
     # 4.) Final ODE-System
     dv = ((F-F_W)/m - g*np.sin(gamma))                          # m/s
