@@ -259,7 +259,7 @@ def gravity_turn(h, g, v, gamma, scenario):
         
     elif h > h_2 and gamma > 0:
         gamma_new = gamma
-        diff_gamma = -((g/v)-(v/(R_0+h)))*np.sin(gamma)
+        diff_gamma = -((g/v)-(v/(R_0+h)))*np.cos(gamma)
         #diff_gamma =  -(g/v)*np.cos(gamma)    
             
     else:
