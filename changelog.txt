@@ -1,6 +1,6 @@
 Changelog containing the version history and information on new features
 
-V1.0.0 Version for GMD, updated Cantera emission calculation, added open cycle CEA calculation, bug fixes
+V1.0.0 Version for GMD paper, updated Cantera emission calculation, added open cycle CEA calculation, bug fixes
 
 V0.2.0 Implemented Cantera emission calculation, emission plot script and bug fixes
 
