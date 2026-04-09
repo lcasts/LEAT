@@ -97,6 +97,7 @@ Jan-Steffen Fischer and Sebastian Winterhoff and Stefanos Fasoulas, Launch Emiss
 ```
 .
 ├── input_data/                 # Contains all input files
+│   ├── cea_species.yaml
 │   ├── config.py
 │   ├── emission_factors.xlsx
 │   ├── launch_sites.xlsx

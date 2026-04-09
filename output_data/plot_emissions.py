@@ -161,7 +161,7 @@ def save_emissions_summary(df, emissions, save_name):
 
 # --- Main Execution ---
 def main():
-    file_path = 'output_data/emissions/EMIS_2023-013_Starlink5492_Emission_Factors.csv'  # Replace with your CSV file path
+    file_path = 'output_data\emissions\EMIS_2025_Ariane_VA263_Emission_Factors_Barker.csv'  # Replace with your CSV file path
     save_name = os.path.splitext(os.path.basename(file_path))[0]  # Extract filename without extension
     df, emission_cols = read_emissions_csv(file_path)
     binned_emissions = aggregate_by_altitude(df, emission_cols)

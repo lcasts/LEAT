@@ -70,6 +70,7 @@ def get_input_data():
         s_path = os.path.join(input_data_folder_path, file_name_scenarios)
         df_scenarios = pd.read_excel(s_path, index_col=0, sheet_name=sheet_name_scenarios)
         df_scenarios.drop('note', axis=1, inplace=True)
+
         # 4.2) Filter Scenarios
         missing_scenarios = [s for s in user_defined_scenarios if s not in df_scenarios.index]
 
@@ -189,7 +190,7 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
         mass_total = df_launch_vehicle_scenario[mass_columns_to_sum].sum(axis=1)
         mass_start = mass_total[launch_vehicle] + mass_payload
         stage1_massflow = df_launch_vehicle_scenario['stage1_total_propellant'].iloc[0] / df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
-        
+
         # 3. Loop through each phase based on the fuel columns as reference for available data
         for col in ['booster_fuel', 'stage1_fuel', 'stage2_fuel', 'stage3_fuel', 'stage4_fuel']:
             # Check if the fuel array is empty
@@ -286,6 +287,7 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
                     
                         if start_with_booster:
                             stage_fuel_mass = []
+
                             if not df_launch_vehicle_scenario['stage1_propellant_massfractions'].iloc[0]:
                                 stage_fuel_massflow = df_launch_vehicle_scenario['stage1_mass_fuel'].iloc[0] / df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
                                 stage_mass_fuel = stage_fuel_massflow * time_end
@@ -314,6 +316,7 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
                 try:
                     if phase_num == 1:
                         booster_fuel_mass = []
+
                         for massfraction in massfractions_data:
                             constituent_mass = float(massfraction) * total_propellant_data
                             booster_fuel_mass.append(constituent_mass)
@@ -333,7 +336,7 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
                                     constituent_mass = float(massfraction) * df_launch_vehicle_scenario['stage1_total_propellant'].iloc[0]
                                     constituent_massflow  = constituent_mass / df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
                                     stage_fuel_mass.append(constituent_massflow * time_end)
-                    
+
                     else:   # Phase > 1
                         stage_fuel_mass = []
                         for massfraction in massfractions_data:
@@ -346,7 +349,7 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
             
             # 3.5) Create a new row for current phase in the loop
             phases.loc["Phase_" + str(phase_num)] = [time_start, time_end, mass_start, mass_burnout, mass_separation, booster_engine, booster_force_sl, booster_force_vac, booster_fuel, booster_fuel_temp, booster_fuel_mass, stage_engine, stage_force_sl, stage_force_vac, stage_fuel, stage_fuel_temp, stage_fuel_mass]
-            
+
             # 3.5) Update data for next phase
             phase_num += 1
             time_start = time_end
@@ -380,7 +383,10 @@ def ode_args_and_initial_values(scenario_name, df_scenarios, df_launch_vehicles,
         p_0 = rho_0 * temp_0 * R
         F_0 = 0
         massflow_0 = 0
-        
+        if launch_vehicle.name in ["LauncherOne", "Pegasus XL"]:
+            v_0 = 920 / 3.6
+        else:
+            v_0 = 0
         ode_args = [g_0, R_0, p_0, max_step, scenario, launch_vehicle, phases, phase_intervals]
         y_0 = np.array([v_0, x_0, s_0, h_0, gamma_0, m_0, date_0 , lat_0, lon_0, p_0, rho_0, temp_0, F_0, massflow_0])
         

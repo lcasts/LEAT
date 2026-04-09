@@ -7,9 +7,9 @@ import numpy as np
 
 #### Choose which Scenarios to process ####
 #-------------------------------------
-all_scenarios = False       # When False only the user_defined_scenarios will be processed
-user_defined_scenarios = ["2023-013_Starlink5492"]    # Based on the scenario name
-use_external_trajectory_data = True
+all_scenarios = True       # When False only the user_defined_scenarios will be processed
+user_defined_scenarios = ["2025_Starship_IFT8_gt_1"] #["2023-013_Starlink5492_gt_1","2025_Ariane_VA263_gt_1","2025_Starship_IFT8_gt_1"]    # Based on the scenario name
+use_external_trajectory_data = False
 file_name_ext_trajectory = 'input_data/trajectory_2023-013_Starlink5492_input.csv'
 #endregion
 
@@ -25,7 +25,7 @@ atol = 1                    # Absolute tolerance
 rtol = 1                    # Relative tolerance
                             # Higher tolerances lead to faster computation but potentially less accurate results, while lower tolerances increase accuracy but may require more computation time.
 use_ode_break = True        # Choose if you want to include an ODE Break Event based on height
-height_ode_break = 100e3    # Maximum Simulation Height [m]
+height_ode_break = 120e3    # Maximum Simulation Height [m]
 
 #### Constants and Variables ####
 #-------------------------------------
@@ -45,7 +45,7 @@ gamma_0 = 90*np.pi/180      # Path angle relative to horizon initially at 90° (
 #-------------------------------------
 compress_data = True                # For faster emission calculation time with NASA CEA
 compress_method = "height"          # Choose between "time" or "height" as the compression interval
-compress_interval = 1               # Choose interval steps in [s] or [km]
+compress_interval = 0.5               # Choose interval steps in [s] or [km]
 compress_atmosphere = "averages"    # Choose "averages" to average the atmosphere data of the interval or choose "latest" for just the value at the given time/height step
 interval_tolerance = 1e-6           # Allow for floating-point precision issues
 #endregion
@@ -58,9 +58,9 @@ calculate_emissions = True
 
 # Choose which emission calculation type to use
 use_emission_factors = True
-emission_factor_method = "stoichiometric"
-use_nasa_cea = False
-use_cantera = False
+emission_factor_method = "Barker2024_seco" #e.g. stoichiometric, LEAT, Barker2024_seco
+use_nasa_cea = True
+use_cantera = True
 
 # Choose if you want to include Black Carbon emission according to James et al. 2021 in the results
 calculate_black_carbon = True
@@ -84,8 +84,7 @@ molar_masses = {
 avogadro_number = 6.02214076e23  # molecules per mole
 
 # Threshold for species to be considered not zero in emissions calculations
-threshold = 1e-6
-
+threshold = 1e-10
 
 #### NASA CEA Config ####
 #-------------------------------------
@@ -102,7 +101,7 @@ frozen_nfz_exception = 3                        # Exception nfz value
 # Afterburning
 afterburning = True                 # Include afterburning in results
 problem_afterburning = "hp"         # tp, hp & uv (choose only one)
-x_ab = 2                            # Afterburning uncertainty factor
+x_ab = 4                            # Afterburning uncertainty factor
 
 # Fuels with specific formula to use instead of data from thermo.lib
 # When the fuel is specified here, this data will always be used instead of the thermo.lib data
@@ -183,13 +182,13 @@ nasa_cea_exe = 'FCEA2.exe'
 file_name_emission_factors = 'emission_factors.xlsx'
 sheet_name_emission_factors = 'Emission_Factors'
 
-file_name_scenarios = 'scenarios.xlsx'
+file_name_scenarios = 'scenarios_GMD_emission.xlsx'
 sheet_name_scenarios = 'scenarios'
 
 file_name_launch_sites = 'launch_sites.xlsx'
 sheet_name_launch_sites = 'launch_sites'
 
-file_name_launch_vehicle = 'LV_Database.xlsx'
+file_name_launch_vehicle = 'LV_Database_GMD.xlsx'
 sheet_name_launch_vehicle = 'LV_Database'
 sheet_name_launch_vehicle_engines = 'Engine'
 

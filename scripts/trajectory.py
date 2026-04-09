@@ -3,6 +3,7 @@ import numpy as np
 from pymsis import msis
 from input_data.config import *
 from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
 from scripts.data_processing import handle_error
 
 #region: Functions necessary for solving the trajectory ODE
@@ -46,22 +47,30 @@ def drag_force(c_w, rho, v, launch_vehicle):
     
     return F_W
 
-def coordinates(inc, lat_1, lon_1, dx):
-    inc = inc*np.pi/180
+def coordinates(azm, lat_1, lon_1, dx):
+    azm_rad = math.radians(azm)
+    lat1_rad = math.radians(lat_1)
+    lon1_rad = math.radians(lon_1)
     c = ((dx/(R_0*2*np.pi))*360)*np.pi/180
 
-    #spärische Trigonometrie, Regel von Neper
+    #sperical trigonometry, Rule of Neper
     #a = delta lon b = delta lat
 
-    #tan(a) = tan(c)*cos(beta)
-    a = math.atan((math.tan(c)*math.cos(inc)))
-    a = a*180/np.pi
-    lon_2 = (lon_1+a)
+    # New Latitude
+    lat2_rad = math.asin(
+        math.sin(lat1_rad) * math.cos(c) +
+        math.cos(lat1_rad) * math.sin(c) * math.cos(azm_rad)
+    )
 
-    #cos(b*) = cos(90-b) = sin(b) = sin(c) * sin(beta)
-    b = math.asin((math.sin(c)*math.sin(inc)))
-    b = b*180/np.pi
-    lat_2 = (lat_1+b)
+    # New Longitude
+    lon2_rad = lon1_rad + math.atan2(
+        math.sin(azm_rad) * math.sin(c) * math.cos(lat1_rad),
+        math.cos(c) - math.sin(lat1_rad) * math.sin(lat2_rad)
+    )
+
+    # zurück in Grad
+    lat_2 = math.degrees(lat2_rad)
+    lon_2 = math.degrees(lon2_rad)
 
     # Differential does not need to be specified since the data is manual calculated
     dlat = 0
@@ -158,9 +167,15 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
     # Total force equation: F(h(p)) = F_sl + (F_vac - F_sl) * (1 - p_a/p_0)
     F = force_sl + (force_vac - force_sl) * (1 - pressure_ratio)
     force_reduced = False
-    
+
+    #Reduces force during lift off
+    if 0 < t <= scenario["t_startup"]:
+        F = (t/scenario["t_startup"])*F
+        force_reduced = True
+
     # Check if altitude is within the specified range for force reduction
-    if scenario["h_fr_start"] <= h <= scenario["h_fr_end"]:
+    
+    if scenario["t_fr_start"] <= t <= scenario["t_fr_end"]:
         # Apply force reduction for Max-Q
         F *= scenario["force_reduced"]
         force_reduced = True
@@ -168,8 +183,15 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
     # Differential not necessary when simply overwriting data
     dF = 0
    
-    #"""
-    if scenario["launch_vehicle"] == "Ariane_62" and not np.isnan(booster_force_vac):
+    """
+    if scenario["launch_vehicle"] == "Starship V2.0 RTLS":
+        if 30000 <= h:
+            # Apply force reduction for Starship
+            F *= 0.68
+            force_reduced = True
+    """
+    """
+    if scenario["launch_vehicle"] == "Ariane 62" and not np.isnan(booster_force_vac):
         # Ariane 62 booster uses time-dependent thrust from P120 curve
         p120_time = np.array([ 0, 5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70,
         74, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 121.2, 125, 130, 138])
@@ -182,7 +204,7 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
         p120_curve = interp1d(p120_time, p120_thrust_pct, bounds_error=False, fill_value=0)
 
         # Calculate thrust percent based on time
-        if t > 0 and t <= 138:
+        if t > 0 and t <= 130:
             booster_thrust_pct = p120_curve(t)
         else:
             booster_thrust_pct = 0
@@ -190,7 +212,7 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
         force_sl = stage_force_sl
         force_vac = stage_force_vac
         F = force_sl + (force_vac - force_sl) * (1 - pressure_ratio)
-        if scenario["h_fr_start"] <= h <= scenario["h_fr_end"]:
+        if scenario["t_fr_start"] <= h <= scenario["t_fr_end"]:
             # Apply force reduction for Max-Q
             F *= scenario["force_reduced"]
             force_reduced = True
@@ -198,7 +220,7 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
     #"""
     return F, F, dF
 
-def calculate_massflow(current_phase, h, scenario):
+def calculate_massflow(current_phase, h, scenario, t):
     if current_phase is None:
         return 0,0,0
     
@@ -219,11 +241,15 @@ def calculate_massflow(current_phase, h, scenario):
     
     # Calculate the mass flow rate
     massflow = total_fuel_mass / time_interval
-
-    if scenario["h_fr_start"] <= h <= scenario["h_fr_end"]:
+    
+    #Reduces force during lift off
+    if 0 < t <= scenario["t_startup"]:
+        massflow =(t/scenario["t_startup"])*massflow
+    
+    if scenario["t_fr_start"] <= t <= scenario["t_fr_end"]:
         # Apply massflow reduction for thrust reduction
         massflow *= scenario["force_reduced"]
-    
+
     mdot = massflow * max_step
     dmdot = 0
     
@@ -256,12 +282,16 @@ def gravity_turn(h, g, v, gamma, scenario):
         # Example: in rad ->  90°  + (3/5  * -3°) = 88.2°
         gamma_new = gamma_0 + (((h - h_1)/( h_2 - h_1)) * -gamma_gt_total)
         diff_gamma = gamma_new - gamma
-        
+        """
+        elif scenario["launch_vehicle"] == "Starship V2.0 RTLS" and h > 25000:
+            gamma_new = gamma
+            diff_gamma = - 0.018 * np.cos((h/200000)*(np.pi/2)) * np.sin(gamma)
+        """
     elif h > h_2 and gamma > 0:
         gamma_new = gamma
         diff_gamma = -((g/v)-(v/(R_0+h)))*np.cos(gamma)
         #diff_gamma =  -(g/v)*np.cos(gamma)    
-            
+    
     else:
         gamma_new = math.radians(0)
         diff_gamma = 0
@@ -274,7 +304,6 @@ def gravity_turn(h, g, v, gamma, scenario):
 def trajectory_ODE(t,y,*ode_args):
     # 0.) Unpack ODE Arguments
     g_0, R_0, p_0, max_step, scenario, launch_vehicle, phases, phase_intervals = ode_args
-    
     # 1.) Initial values of ODE-System (y = y_0 = [v_0, x_0, ...])
     v = y[0]
     x = y[1]
@@ -304,7 +333,7 @@ def trajectory_ODE(t,y,*ode_args):
         massflow = y[13]  # Use the initial value passed in y
         dmdot = 0         # No derivative at t=0
     else:
-        massflow, y[13], dmdot = calculate_massflow(current_phase, h, scenario)
+        massflow, y[13], dmdot = calculate_massflow(current_phase, h, scenario,t)
     
     # 4.) Final ODE-System
     dv = ((F-F_W)/m - g*np.sin(gamma))                          # m/s
@@ -318,7 +347,8 @@ def trajectory_ODE(t,y,*ode_args):
     else:
         dm = - massflow                                        # kg/s
     d_date = 1                                                  # 1 timestep
-    y[7], dlat, y[8], dlon = coordinates(scenario["inclination"], scenario["lat"], scenario["lon"], x)
+    
+    y[7], dlat, y[8], dlon = coordinates(scenario["azimuth"], scenario["lat"], scenario["lon"], x)
     y[9], dp, y[10], drho, y[11], dT = calculate_atmosphere_data(date, lon, lat, h)
     #print(f"t: {t:.2f} s, h: {h:.2f} km, v: {v:.2f} m/s, gamma: {np.degrees(gamma):.2f}°")
     return [dv, dx, ds, dh, diff_gamma, dm, d_date , dlat, dlon, dp, drho, dT, dF, dmdot]
