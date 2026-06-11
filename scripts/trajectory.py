@@ -18,12 +18,13 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     d_n = launch_vehicle['d_n']
     d_f = launch_vehicle['d_f']
     a_r = launch_vehicle['A_R']
+    a_e_a_r = launch_vehicle['A_e_A_R']
     
     # Gleichung nach Fleeman, siehe Dokumentation
     if ma<=1 and v!= 0:
         q = 0.5*rho*(abs(v))**2
         c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
-        c_w_bp = (1-(a_r)/(a_r))*(0.12+0.13*abs(ma)**2)
+        c_w_bp = (1-(a_e_a_r))*(0.12+0.13*abs(ma)**2)
         c_w_bw = 0
         c_w = c_w_bf + c_w_bp + c_w_bw
         #c_w = 0.053*(l/d)*(ma*l/(0.5*rho*v**2))**0.2
@@ -36,7 +37,7 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     else:
         q = 0.5*rho*(abs(v))**2
         c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
-        c_w_bp = (1-(a_r)/(a_r))*(0.25/ma)
+        c_w_bp = (1-(a_e_a_r))*(0.25/ma)
         c_w_bw = ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(l_n/d_n)))**1.69) * (1-(d_n/d_f)**2) + ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(0.5)))**1.69) * (d_n/d_f)**2
         c_w = c_w_bf + c_w_bp + c_w_bw
     return c_w
