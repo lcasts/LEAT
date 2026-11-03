@@ -34,9 +34,11 @@ def get_input_data():
             for column in columns_to_split:
                 df_launch_vehicles[column] = df_launch_vehicles[column].apply(split_data)
                 
-            # Drop last columns
+            # Drop the columns from "Source" on, but keep the optional column UP
             source_index = df_launch_vehicles.columns.get_loc("Source")
-            df_launch_vehicles = df_launch_vehicles.iloc[:, :source_index]
+            keep_after_source = [c for c in ["UP"] if c in df_launch_vehicles.columns]
+            df_launch_vehicles = pd.concat([df_launch_vehicles.iloc[:, :source_index],
+                                            df_launch_vehicles[keep_after_source]], axis=1)
             
             return df_launch_vehicles
         
@@ -82,14 +84,25 @@ def get_input_data():
         else:
             df_scenarios = df_scenarios.loc[df_scenarios.index.isin(user_defined_scenarios)]
         # 4.3) Include Launch Sites Data
+        unknown_sites = df_scenarios.loc[~df_scenarios['launch_site'].isin(df_launch_sites.index), 'launch_site']
+        if not unknown_sites.empty:
+            print(f"Warning: {len(unknown_sites)} scenarios have a launch site that is not in {file_name_launch_sites} "
+                  f"and will be ignored: {unknown_sites.to_dict()}")
         df_scenarios = pd.merge(df_scenarios, df_launch_sites[['lat', 'lon', 'alt']], left_on='launch_site', right_index=True)
         
         # 5) Launch Vehicles
         # 5.1) Import Launch Vehicles with Filter
         lv_path = os.path.join(input_data_folder_path, file_name_launch_vehicle)
         df_launch_vehicles = pd.read_excel(lv_path, index_col=0, sheet_name=sheet_name_launch_vehicle)
+        # Vehicle names that fly with the data of another entry, see launch_vehicle_aliases
+        for alias, source in launch_vehicle_aliases.items():
+            if alias not in df_launch_vehicles.index and source in df_launch_vehicles.index:
+                df_launch_vehicles.loc[alias] = df_launch_vehicles.loc[source]
         # 5.2) Filter Launch Vehicles
         launch_vehicles_to_filter = df_scenarios['launch_vehicle'].unique().tolist()
+        # Add the booster entries used for recovery returns (imported here to avoid a circular import)
+        from scripts.trajectory_recovery import recovery_vehicle
+        launch_vehicles_to_filter += [recovery_vehicle(v) for v in launch_vehicles_to_filter]
         df_launch_vehicles = df_launch_vehicles.loc[df_launch_vehicles.index.isin(launch_vehicles_to_filter)]
         # 5.3) Data Cleaning of Dataframe
         df_launch_vehicles = clean_launchvehicle_dataframe(df_launch_vehicles)
@@ -187,38 +200,72 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
                                'stage3_total_propellant', 'stage3_dry_mass',
                                'stage4_total_propellant', 'stage4_dry_mass']
         mass_payload = df_scenarios.loc[scenario_name]['mass_payload']
+        # Optional LV column UP (unaccounted mass) is carried like the payload and never separated
+        mass_up = df_launch_vehicle_scenario['UP'].iloc[0] if 'UP' in df_launch_vehicle_scenario else 0.0
+        mass_up = 0.0 if pd.isna(mass_up) else float(mass_up)
         mass_total = df_launch_vehicle_scenario[mass_columns_to_sum].sum(axis=1)
-        mass_start = mass_total[launch_vehicle] + mass_payload
+        mass_start = mass_total[launch_vehicle] + mass_payload + mass_up
         stage1_massflow = df_launch_vehicle_scenario['stage1_total_propellant'].iloc[0] / df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
+
+        # Special cases for boosters burning longer than (e.g. GSLV Mk II) or as long as stage 1
+        start_with_booster = df_launch_vehicle_scenario['start_with_booster'].iloc[0]
+        booster_burntime = df_launch_vehicle_scenario['booster_burntime'].iloc[0]
+        stage1_burntime = df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
+        booster_outlasts_stage1 = bool(start_with_booster) and booster_burntime > stage1_burntime
+        burnout_together = bool(start_with_booster) and booster_burntime == stage1_burntime
+
+        def booster_constituent_masses(share):
+            # Booster propellant constituents burnt within a share of the booster burn time
+            booster_massfractions = df_launch_vehicle_scenario['booster_propellant_massfractions'].iloc[0]
+            if booster_massfractions:
+                return [float(mf) * df_launch_vehicle_scenario['booster_total_propellant'].iloc[0] * share
+                        for mf in booster_massfractions]
+            return [df_launch_vehicle_scenario['booster_mass_fuel'].iloc[0] * share,
+                    df_launch_vehicle_scenario['booster_mass_ox'].iloc[0] * share]
 
         # 3. Loop through each phase based on the fuel columns as reference for available data
         for col in ['booster_fuel', 'stage1_fuel', 'stage2_fuel', 'stage3_fuel', 'stage4_fuel']:
             # Check if the fuel array is empty
             if not df_launch_vehicle_scenario[col].any():
                 break
-            
-            # Check if stage 1 starts with the booster
-            start_with_booster = df_launch_vehicle_scenario['start_with_booster'].iloc[0]
-            
+
+            # Stage 1 burnt out together with the booster in Phase 1, nothing left for Phase 2
+            if col == 'stage1_fuel' and burnout_together:
+                continue
+
             # 3.1) Calculate end time and burnout mass for current phase
             # Phase 1: Only Booster
             if phase_num == 1 and not start_with_booster:
                 time_end = df_launch_vehicle_scenario['booster_burntime'].iloc[0]
+                delta_t = time_end - time_start
                 mass_burnout = mass_start - df_launch_vehicle_scenario[col.replace("_fuel", "_total_propellant")].iloc[0]
+            # Phase 1: Booster & Stage 1, booster outlasting stage 1 - ends at stage 1 burnout
+            elif phase_num == 1 and booster_outlasts_stage1:
+                time_end = stage1_burntime
+                delta_t = time_end - time_start
+                booster_fuel_burnt = df_launch_vehicle_scenario['booster_total_propellant'].iloc[0] * stage1_burntime / booster_burntime
+                mass_burnout = mass_start - booster_fuel_burnt - df_launch_vehicle_scenario['stage1_total_propellant'].iloc[0]
             # Phase 1: Booster & Stage 1
-            if phase_num == 1 and start_with_booster:
+            elif phase_num == 1 and start_with_booster:
                 time_end = df_launch_vehicle_scenario['booster_burntime'].iloc[0]
+                delta_t = time_end - time_start
                 fuel_mass_stage1 = stage1_massflow * time_end
                 mass_burnout = mass_start - df_launch_vehicle_scenario[col.replace("_fuel", "_total_propellant")].iloc[0] - fuel_mass_stage1
-            
+
+            # Phase 2: Booster alone after stage 1 burnout
+            elif phase_num == 2 and booster_outlasts_stage1:
+                time_end = booster_burntime
+                delta_t = time_end - time_start
+                mass_burnout = mass_start - df_launch_vehicle_scenario['booster_total_propellant'].iloc[0] * delta_t / booster_burntime
+
             # Phase 2: Stage 1 (Start after Booster)
-            elif phase_num == 2 and not start_with_booster:
+            elif phase_num == 2 and col == 'stage1_fuel' and not start_with_booster:
                 time_end = time_start + df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
                 delta_t = time_end - time_start
                 fuel_mass_stage1 = stage1_massflow * delta_t
                 mass_burnout = mass_start - fuel_mass_stage1
             # Phase 2: Stage 1 (Started with Booster)
-            elif phase_num == 2 and start_with_booster:
+            elif phase_num == 2 and col == 'stage1_fuel' and start_with_booster:
                 time_end = df_launch_vehicle_scenario['stage1_burntime'].iloc[0]
                 delta_t = time_end - time_start
                 fuel_mass_stage1 = stage1_massflow * delta_t
@@ -232,7 +279,15 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
             
             # 3.2) Calculate separation mass for current phase
             mass_separation = mass_burnout - df_launch_vehicle_scenario[col.replace("_fuel", "_dry_mass")].iloc[0]
-            
+            booster_dry_mass = df_launch_vehicle_scenario['booster_dry_mass'].iloc[0]
+            stage1_dry_mass = df_launch_vehicle_scenario['stage1_dry_mass'].iloc[0]
+            if phase_num == 1 and booster_outlasts_stage1:
+                mass_separation = mass_burnout      # booster still burning, nothing separates
+            elif phase_num == 1 and burnout_together:
+                mass_separation = mass_burnout - booster_dry_mass - stage1_dry_mass
+            elif phase_num == 2 and booster_outlasts_stage1:
+                mass_separation = mass_burnout - booster_dry_mass - stage1_dry_mass
+
             # 3.3) General data of Booster and Stage according to phase
             if phase_num == 1:
                 booster_engine = df_launch_vehicle_scenario["booster_engine"].iloc[0]
@@ -345,8 +400,25 @@ def phases(scenario_name, df_scenarios, df_launch_vehicles):
                             stage_fuel_mass.append(constituent_massflow * delta_t)
                                                     
                 except Exception as e:
-                    handle_error(e, "phases", "Error in fuel mass calculation using massfractions.")                
-            
+                    handle_error(e, "phases", "Error in fuel mass calculation using massfractions.")
+
+            # 3.4b) Booster outlasting stage 1: Phase 1 burns part of the booster propellant, Phase 2 the rest
+            if booster_outlasts_stage1 and phase_num == 1:
+                booster_fuel_mass = booster_constituent_masses(stage1_burntime / booster_burntime)
+            elif booster_outlasts_stage1 and phase_num == 2:
+                booster_engine = df_launch_vehicle_scenario["booster_engine"].iloc[0]
+                booster_force_sl = df_launch_vehicle_scenario["booster_force_sl"].iloc[0]
+                booster_force_vac = df_launch_vehicle_scenario["booster_force_vac"].iloc[0]
+                booster_fuel = df_launch_vehicle_scenario["booster_fuel"].iloc[0]
+                booster_fuel_temp = df_launch_vehicle_scenario["booster_fuel_temp"].iloc[0]
+                booster_fuel_mass = booster_constituent_masses(delta_t / booster_burntime)
+                stage_engine = np.nan
+                stage_force_sl = np.nan
+                stage_force_vac = np.nan
+                stage_fuel = np.nan
+                stage_fuel_temp = np.nan
+                stage_fuel_mass = np.nan
+
             # 3.5) Create a new row for current phase in the loop
             phases.loc["Phase_" + str(phase_num)] = [time_start, time_end, mass_start, mass_burnout, mass_separation, booster_engine, booster_force_sl, booster_force_vac, booster_fuel, booster_fuel_temp, booster_fuel_mass, stage_engine, stage_force_sl, stage_force_vac, stage_fuel, stage_fuel_temp, stage_fuel_mass]
 
@@ -377,10 +449,9 @@ def ode_args_and_initial_values(scenario_name, df_scenarios, df_launch_vehicles,
         lon_0 = scenario['lon']
         phase_intervals = [phases.at[f'Phase_{i}', 'time_start'] for i in range(1, len(phases) + 1)]
         phase_intervals.append(phases.at[f'Phase_{len(phases)}', 'time_end'])
+        # Sea level reference state for the pressure ratio of the thrust equation
         atmos_0 = msis.run(scenario["date"], lon_0, lat_0, 0)
-        rho_0 = atmos_0[0, 0]
-        temp_0 = atmos_0[0, 10]
-        p_0 = rho_0 * temp_0 * R
+        rho_0, temp_0, p_0, c_0, df_mf_0, kappa_0, r_mix_0 = atmosphere_mixture(atmos_0)
         F_0 = 0
         massflow_0 = 0
         if launch_vehicle.name in ["LauncherOne", "Pegasus XL"]:
@@ -388,7 +459,8 @@ def ode_args_and_initial_values(scenario_name, df_scenarios, df_launch_vehicles,
         else:
             v_0 = 0
         ode_args = [g_0, R_0, p_0, max_step, scenario, launch_vehicle, phases, phase_intervals]
-        y_0 = np.array([v_0, x_0, s_0, h_0, gamma_0, m_0, date_0 , lat_0, lon_0, p_0, rho_0, temp_0, F_0, massflow_0])
+        # kappa and R of the local mixture are carried in the state vector like p, rho and temp
+        y_0 = np.array([v_0, x_0, s_0, h_0, gamma_0, m_0, date_0 , lat_0, lon_0, p_0, rho_0, temp_0, F_0, massflow_0, kappa_0, r_mix_0])
         
     except Exception as e:
         handle_error(e, "ode_args_and_initial_values", "Error finding required data.")
@@ -396,7 +468,10 @@ def ode_args_and_initial_values(scenario_name, df_scenarios, df_launch_vehicles,
     return ode_args, y_0
 
 # Post data processing of ODE results
-def process_and_save_ODE_results(results, scenario_name):    
+def process_and_save_ODE_results(results, scenario_name):
+    # Propellant per row is the mass flow times the actual solver step
+    timestep = np.diff(results.t, prepend=results.t[0])
+
     output_data = pd.DataFrame({
         "t": results.t,
         "h": results.y[3] / 1000,
@@ -412,7 +487,9 @@ def process_and_save_ODE_results(results, scenario_name):
         "rho": results.y[10],
         "temp": results.y[11],
         "F": results.y[12],
-        "d_m": results.y[13]    # Only massflow of fuel per timestep, not separation mass
+        "d_m": results.y[13] * timestep,    # Only fuel burnt per timestep, not separation mass
+        "kappa": results.y[14], # Isentropic exponent of the local mixture
+        "r_mix": results.y[15]  # Specific gas constant of the local mixture [J/(kg*K)]
     })
     
     # Convert Unix timestamp to datetime format
@@ -494,19 +571,12 @@ def compress_and_save_trajectory_results(output_data, scenario_name):
         # Compress based on height
         elif compress_method == "height":
             last_height = output_data['h'].iloc[-1]
-            height = 0
             d_m_sum = 0
 
-            # Hol den ersten Eintrag der Höhe (erste Zeile von height_data)
-            first_height_value = output_data['h'].iloc[0]
+            # Start the height grid below the lowest altitude, which can be negative during the thrust ramp
+            first_height_value = output_data['h'].min()
+            height = np.floor(first_height_value / compress_interval) * compress_interval
 
-            # Berechne das abgerundete ganzzahlige Vielfache n
-            if first_height_value > height+compress_interval:
-                # Berechne das Vielfache n als abgerundeten Wert
-                n = int((first_height_value - height) // compress_interval) 
-                # Setze die Starthöhe auf height + compress_interval * n
-                height = height + compress_interval * n    
-                    
             if compress_atmosphere == "latest":
                 # Loop through "output_data" based on height intervals
                 while height <= last_height:
@@ -647,26 +717,17 @@ def save_emission_results(emission_results, scenario_name, type):
     except Exception as e:
         handle_error(e, "save_emission_results", "Error finding required data.")
 
-# Calculate Athmosphere Data for Afterburning
-def calculate_atmosphere_data(row):
+# Thermodynamic state of the local NRLMSIS mixture
+def atmosphere_mixture(atmosphere):
+    """Density, temperature, pressure (p = n*k_B*T), speed of sound, mass fractions, kappa and R of the NRLMSIS mixture."""
     # Helper function to handle NaN values
     def handle_nan(value):
         return 0 if np.isnan(value) else value
-    
-    # Extract date, longitude, latitude, and height from the row
-    date = row['date']
-    lon = row['lon']
-    lat = row['lat']
-    height = row['h']
-    
-    # Run msis Atmosphere Model Function
-    atmosphere = msis.run(date, lon, lat, height)
-    
-    # Total mass density (kg/m3)
+
+    # Total mass density (kg/m3) and temperature (K)
     rho_atm = handle_nan(atmosphere[0, 0])
     t_atm = handle_nan(atmosphere[0, 10])
-    p_atm = rho_atm * t_atm * R
-    
+
     # Raw Density Data of Species (in molecules per m3)
     densities = {
         'N2': handle_nan(atmosphere[0, 1]),
@@ -679,16 +740,43 @@ def calculate_atmosphere_data(row):
         #'aox': handle_nan(atmosphere[0, 8]),
         'NO': handle_nan(atmosphere[0, 9])
     }
-    
+
     # Convert number densities to mass densities (kg/m3)
     mass_densities = {species: densities[species] * molar_masses[species] / avogadro_number for species in densities}
-    
+
     # Calculate mass fractions (kg/kg)
     mass_fractions = {species: mass_densities[species] / rho_atm for species in mass_densities}
 
     # Convert mass fractions dictionary to DataFrame
     df_atm_massfractions = pd.DataFrame([mass_fractions])
-    
+
+    # Total number density (1/m3) and pressure from the mixture itself
+    total_number_density = sum(densities.values())
+    p_atm = total_number_density * boltzmann_constant * t_atm
+
+    # Mean molar mass, specific gas constant and isentropic exponent of the mixture
+    molar_mass_mix = sum(densities[s] * molar_masses[s] for s in densities) / total_number_density
+    r_mix = universal_gas_constant / molar_mass_mix
+    cv_over_r = sum(densities[s] * (1.5 if s in monatomic_species else 2.5)
+                    for s in densities) / total_number_density
+    kappa_mix = 1.0 + 1.0 / cv_over_r
+    c_atm = np.sqrt(kappa_mix * r_mix * t_atm)
+
+    return rho_atm, t_atm, p_atm, c_atm, df_atm_massfractions, kappa_mix, r_mix
+
+# Calculate Athmosphere Data for Afterburning
+def calculate_atmosphere_data(row):
+    # Extract date, longitude, latitude, and height from the row
+    date = row['date']
+    lon = row['lon']
+    lat = row['lat']
+    height = row['h']
+
+    # Run msis Atmosphere Model Function
+    atmosphere = msis.run(date, lon, lat, height)
+
+    rho_atm, t_atm, p_atm, c_atm, df_atm_massfractions, kappa_mix, r_mix = atmosphere_mixture(atmosphere)
+
     return rho_atm, t_atm, p_atm, df_atm_massfractions
-    
+
 #endregion

@@ -4,13 +4,18 @@ from pymsis import msis
 from input_data.config import *
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
-from scripts.data_processing import handle_error
+from scripts.data_processing import handle_error, atmosphere_mixture
 
 #region: Functions necessary for solving the trajectory ODE
-def drag_coefficient(temp, v, rho, launch_vehicle):
-    kappa = 1.4
-    R = 287.1
-    c = np.sqrt(kappa*R*temp)
+def skin_friction(ma, q, l, d):
+    # Fleeman skin friction C_f = 0.053 (l/d) [M/(q*l)]^0.2 with q in psf and l in ft
+    q_psf = q / 47.880259
+    l_ft = l / 0.3048
+    return 0.053*(l/d)*(abs(ma)/(q_psf * l_ft))**0.2
+
+def drag_coefficient(temp, v, rho, launch_vehicle, kappa_mix=kappa, r_mix=R):
+    # Speed of sound from kappa and R of the local NRLMSIS mixture
+    c = np.sqrt(kappa_mix*r_mix*temp)
     ma = v/c
     l = launch_vehicle['l']
     d = launch_vehicle['d']
@@ -18,12 +23,12 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
     d_n = launch_vehicle['d_n']
     d_f = launch_vehicle['d_f']
     a_r = launch_vehicle['A_R']
-    a_e_a_r = launch_vehicle['A_e_A_R']
+    a_e_a_r = launch_vehicle['A_e_A_R']   # Nozzle exit area / reference area for the base drag
     
-    # Gleichung nach Fleeman, siehe Dokumentation
+    # Drag equations after Fleeman, see documentation
     if ma<=1 and v!= 0:
         q = 0.5*rho*(abs(v))**2
-        c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
+        c_w_bf = skin_friction(ma, q, l, d)
         c_w_bp = (1-(a_e_a_r))*(0.12+0.13*abs(ma)**2)
         c_w_bw = 0
         c_w = c_w_bf + c_w_bp + c_w_bw
@@ -36,7 +41,7 @@ def drag_coefficient(temp, v, rho, launch_vehicle):
         c_w = 0.4
     else:
         q = 0.5*rho*(abs(v))**2
-        c_w_bf = 0.053*(l/d)*(abs(ma)/((q*47.880259) * (l*0.3048)))**0.2
+        c_w_bf = skin_friction(ma, q, l, d)
         c_w_bp = (1-(a_e_a_r))*(0.25/ma)
         c_w_bw = ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(l_n/d_n)))**1.69) * (1-(d_n/d_f)**2) + ((1.59 + 1.83/(ma**2))*(np.arctan(0.5/(0.5)))**1.69) * (d_n/d_f)**2
         c_w = c_w_bf + c_w_bp + c_w_bw
@@ -69,7 +74,7 @@ def coordinates(azm, lat_1, lon_1, dx):
         math.cos(c) - math.sin(lat1_rad) * math.sin(lat2_rad)
     )
 
-    # zurück in Grad
+    # Back to degrees
     lat_2 = math.degrees(lat2_rad)
     lon_2 = math.degrees(lon2_rad)
 
@@ -136,12 +141,10 @@ def get_phases(t, max_step, phases, phase_intervals):
     return phase_changed, current_phase, prev_phase
 
 def calculate_force(current_phase, pressure_ratio, h, scenario, t):
-    # Check if current phase is None
+    # No active engine: return F, state value and derivative as zero
     if current_phase is None:
-        F = 0
-        force_reduced = False 
-        return F, force_reduced
-    
+        return 0, 0, 0
+
     # Init Force Data
     booster_force_sl = current_phase["booster_force_sl"]
     booster_force_vac = current_phase["booster_force_vac"]
@@ -221,13 +224,44 @@ def calculate_force(current_phase, pressure_ratio, h, scenario, t):
     #"""
     return F, F, dF
 
+def _ramp_integral(a, b, t_startup):
+    # Integral of the startup ramp min(t/t_startup, 1) over [a, b]
+    if t_startup <= 0:
+        return b - a
+    lo = min(max(a, 0.0), t_startup)
+    hi = min(max(b, 0.0), t_startup)
+    return (hi**2 - lo**2) / (2.0 * t_startup) + (max(b, t_startup) - max(a, t_startup))
+
+def effective_burn_time(time_start, time_end, scenario):
+    """Effective burn time [s] of a phase with start-up ramp and Max-Q throttling, so the full propellant is burnt."""
+    def value(key, default):
+        try:
+            number = float(scenario[key])
+        except (KeyError, TypeError, ValueError):
+            return default
+        return default if math.isnan(number) else number
+
+    t_startup = value("t_startup", 0.0)
+    burn_time = _ramp_integral(time_start, time_end, t_startup)
+
+    # Max-Q throttling reduces the profile to force_reduced inside its window
+    fr_start = value("t_fr_start", 0.0)
+    fr_end = value("t_fr_end", 0.0)
+    force_reduced = value("force_reduced", 1.0)
+    window_start = max(time_start, fr_start)
+    window_end = min(time_end, fr_end)
+    if window_end > window_start:
+        burn_time -= (1.0 - force_reduced) * _ramp_integral(window_start, window_end, t_startup)
+
+    return burn_time
+
 def calculate_massflow(current_phase, h, scenario, t):
     if current_phase is None:
         return 0,0,0
-    
+
     # Time Intervall of current phase
     time_interval = current_phase["time_end"] - current_phase["time_start"]
-    
+
     # Total fuel mass
     booster_fuel_mass = current_phase["booster_fuel_mass"]
     stage_fuel_mass = current_phase["stage_fuel_mass"]
@@ -239,37 +273,41 @@ def calculate_massflow(current_phase, h, scenario, t):
         fuel_masses.extend(stage_fuel_mass)
     
     total_fuel_mass = np.sum(fuel_masses)
-    
-    # Calculate the mass flow rate
-    massflow = total_fuel_mass / time_interval
-    
+
+    # Mass flow from the propellant and the effective burn time of the throttle profile
+    burn_time = effective_burn_time(current_phase["time_start"], current_phase["time_end"], scenario)
+    massflow = total_fuel_mass / burn_time if burn_time > 0 else 0.0
+
     #Reduces force during lift off
     if 0 < t <= scenario["t_startup"]:
         massflow =(t/scenario["t_startup"])*massflow
-    
+
     if scenario["t_fr_start"] <= t <= scenario["t_fr_end"]:
         # Apply massflow reduction for thrust reduction
         massflow *= scenario["force_reduced"]
 
-    mdot = massflow * max_step
+    # The state carries the mass flow [kg/s], d_m per row follows in process_and_save_ODE_results()
+    mdot = massflow
     dmdot = 0
-    
+
     return massflow, mdot, dmdot
 
 def calculate_atmosphere_data(date, lon, lat, h):
     # Current Position       # h in km required
     atmosphere = msis.run(np.datetime64(int(date), 's'), lon, lat, h/1000)
-    rho = atmosphere[0, 0]
-    temp = atmosphere[0, 10]
-    p_a = rho * temp * R
-    
+
+    # Pressure, kappa and R from the local mixture, see data_processing.atmosphere_mixture()
+    rho, temp, p_a, c, df_mf, kappa_mix, r_mix = atmosphere_mixture(atmosphere)
+
     # Differential does not need to be specified since the data is manual calculated
     dp = 0
     drho = 0
     dT = 0
-    
-    return p_a, dp, rho, drho, temp, dT
-    
+    dkappa = 0
+    dr_mix = 0
+
+    return p_a, dp, rho, drho, temp, dT, kappa_mix, dkappa, r_mix, dr_mix
+
 def gravity_turn(h, g, v, gamma, scenario):
     h_1 = scenario["h_gt_start"] + scenario["alt"]
     h_2 = scenario["h_gt_end"] + scenario["alt"]
@@ -320,13 +358,15 @@ def trajectory_ODE(t,y,*ode_args):
     temp = y[11]
     F = y[12]
     mdot = y[13]
-    
+    kappa_mix = y[14]
+    r_mix = y[15]
+
     # 2.) Definition of Phases and Phase Changes
     phase_changed, current_phase, prev_phase = get_phases(t, max_step, phases, phase_intervals)
 
     # 3.) Required Variables
     g = gravity(g_0, R_0, h)                        
-    c_w = drag_coefficient(temp, v, rho, launch_vehicle)
+    c_w = drag_coefficient(temp, v, rho, launch_vehicle, kappa_mix, r_mix)
     F_W = drag_force(c_w, rho, v, launch_vehicle)
     pressure_ratio = p_a / p_0
     F, y[12], dF = calculate_force(current_phase, pressure_ratio, h, scenario, t)
@@ -350,43 +390,71 @@ def trajectory_ODE(t,y,*ode_args):
     d_date = 1                                                  # 1 timestep
     
     y[7], dlat, y[8], dlon = coordinates(scenario["azimuth"], scenario["lat"], scenario["lon"], x)
-    y[9], dp, y[10], drho, y[11], dT = calculate_atmosphere_data(date, lon, lat, h)
+    y[9], dp, y[10], drho, y[11], dT, y[14], dkappa, y[15], dr_mix = calculate_atmosphere_data(date, lon, lat, h)
     #print(f"t: {t:.2f} s, h: {h:.2f} km, v: {v:.2f} m/s, gamma: {np.degrees(gamma):.2f}°")
-    return [dv, dx, ds, dh, diff_gamma, dm, d_date , dlat, dlon, dp, drho, dT, dF, dmdot]
+    return [dv, dx, ds, dh, diff_gamma, dm, d_date , dlat, dlon, dp, drho, dT, dF, dmdot, dkappa, dr_mix]
 
 # Solving the ODE
 def solve_ODE(y_0, ode_args):
     try:
         print(colors.BOLD + colors.BLUE + "Solving ODE..." + colors.END)
         
+        phase_intervals = ode_args[7]
+
+        # Optional scenario column h_break_km sets an own break height, also with use_ode_break = False
+        scenario = ode_args[4]
+        height_break = height_ode_break
+        own_height_break = False
+        if "h_break_km" in scenario.index and not np.isnan(float(scenario["h_break_km"])):
+            height_break = float(scenario["h_break_km"]) * 1000.0
+            own_height_break = True
+
         # Event function for an ODE Break based on height
         def height_event(t, y, *args):
             h = y[3]
-            return h - height_ode_break
+            return h - height_break
 
         # Event properties
         height_event.terminal = True
         height_event.direction = 0
-        
+
+        # Second break event when the last phase has burnt out
+        def phase_end_event(t, y, *args):
+            return t - phase_intervals[-1]
+
+        phase_end_event.terminal = True
+        phase_end_event.direction = 1
+
         # Solve ODE with or without Event Break based on height
-        if use_ode_break:
+        if use_ode_break or own_height_break:
+            events = [height_event, phase_end_event]
             results = solve_ivp(
                 trajectory_ODE, t_span, y_0, method=numeric_method,
                 args=ode_args, max_step=max_step, atol=atol, rtol=rtol,
-                events=height_event
+                events=events
             )
         else:
+            events = [phase_end_event]
             results = solve_ivp(
                 trajectory_ODE, t_span, y_0, method=numeric_method,
-                args=ode_args, max_step=max_step, atol=atol, rtol=rtol
+                args=ode_args, max_step=max_step, atol=atol, rtol=rtol,
+                events=events
             )
-        
+
         # Print Statements
-        if results.status == 1:
-            print(colors.BOLD + colors.GREEN + "ODE solution stopped as height reached the specified break point." + colors.END)
+        phase_end_reached = len(results.t_events[-1]) > 0
+        if phase_end_reached:
+            print(colors.BOLD + colors.YELLOW
+                  + "Warning: ODE solution stopped because the last phase burnt out before the break height "
+                    f"was reached - t = {results.t[-1]:.1f} s, {get_current_phase(results.t[-1], phase_intervals)}, "
+                    f"h = {results.y[3][-1] / 1000:.1f} km (break height {height_break / 1000:.1f} km)."
+                  + colors.END)
+        elif results.status == 1:
+            print(colors.BOLD + colors.GREEN + "ODE solution stopped as height reached the specified break point "
+                  f"({height_break / 1000:.1f} km at t = {results.t[-1]:.1f} s)." + colors.END)
         else:
             print(colors.BOLD + colors.GREEN + "Solved ODE and returning data." + colors.END)
-            
+
         return results
     
     except Exception as e:

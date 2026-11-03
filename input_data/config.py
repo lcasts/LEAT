@@ -3,12 +3,13 @@
 #region: #### General Config ####
 #### Imports ####
 #-------------------------------------
+import os
 import numpy as np
 
 #### Choose which Scenarios to process ####
 #-------------------------------------
 all_scenarios = True       # When False only the user_defined_scenarios will be processed
-user_defined_scenarios = ["2025_Starship_IFT8_gt_1"] #["2023-013_Starlink5492_gt_1","2025_Ariane_VA263_gt_1","2025_Starship_IFT8_gt_1"]    # Based on the scenario name
+user_defined_scenarios = ["UC2_2023-022_Inmarsat_6_F2_ADSL"]   # Based on the scenario name, GMD examples: "2023-013_Starlink5492_gt_1", "2025_Ariane_VA263_gt_1", "2025_Starship_IFT8_gt_1"
 use_external_trajectory_data = False
 file_name_ext_trajectory = 'input_data/trajectory_2023-013_Starlink5492_input.csv'
 #endregion
@@ -31,8 +32,8 @@ height_ode_break = 120e3    # Maximum Simulation Height [m]
 #-------------------------------------
 R_0 = 6.378388e6            # Mean Earth Radius [m] (WGS84)
 g_0 = 9.807                 # Mean Earth Gravity [m/s²]
-R = 287.058                 # J/(kg·K)      for p = ρ⋅R⋅T
-kappa = 1.4                  # Ratio of specific heats (Cp/Cv) for air
+R = 287.058                 # J/(kg·K)      Dry air, fallback only (the local NRLMSIS mixture is used instead)
+kappa = 1.4                 # Ratio of specific heats (Cp/Cv) for dry air, fallback only
 
 #### Initial Values (Trajectory ODE) ####
 #-------------------------------------
@@ -62,8 +63,38 @@ emission_factor_method = "Barker2024_seco" #e.g. stoichiometric, LEAT, Barker202
 use_nasa_cea = True
 use_cantera = True
 
+# Cantera cannot solve solid propellants; True skips such engines, False drops the Cantera result of the scenario
+cantera_skip_failed_engines = False
+
 # Choose if you want to include Black Carbon emission according to James et al. 2021 in the results
 calculate_black_carbon = True
+
+#### Recovery Config ####
+#-------------------------------------
+calculate_recovery = False          # Compute the booster return of RTLS, ADSL and SEA scenarios
+recovery_shock = True               # Run the descent afterburning against the air behind the bow shock
+recovery_nox_t_min = 800.0          # Minimum post-shock temperature for air NOx of unpowered rows [K]
+
+# Bow shock calculation with NASA CEA
+problem_hotgas_calculation = "shock"    # shock, or tp/hp at the post-shock state
+shock_flags = "inc eq"                  # CEA shock options (inc/ref, eq/fr)
+shock_state = "inc_eq"                  # Evaluated station: inc_eq, inc_fz, ref_eq, ref_fz
+shock_ions = False                      # Include ionized species
+shock_debug = False                     # CEA debug flag
+shock_mach_min = 1.05                   # Minimum Mach number for the CEA shock problem
+shock_input = "u1"                      # u1: free-stream velocity, mach1: Mach number
+afterburning_state = "static"           # Shock state used for afterburning: static or total
+
+# Launch site codes that share one recovery template
+recovery_site_aliases = {"VS-SLC4E": "VSFBS-SLC4E", "VSFVS-SLC4E": "VSFBS-SLC4E", "SB-OLPA": "STB-OLP1"}
+
+# Vehicle names without own database entry and the entry whose data they use
+launch_vehicle_aliases = {}
+
+# Optional scenario columns (empty = nominal flight):
+#   h_break_km             ascent stops at this altitude [km]
+#   t_recovery_end         booster return stops at this flight time [s]
+#   recovery_landing_burn  0 = booster return ends before the landing burn
 
 #### Emission Constants ####
 #-------------------------------------
@@ -82,6 +113,11 @@ molar_masses = {
 
 # Avogadro's number
 avogadro_number = 6.02214076e23  # molecules per mole
+
+# Constants for the local NRLMSIS mixture
+boltzmann_constant = 1.380649e-23       # J/K
+universal_gas_constant = 8.314462618    # J/(mol*K)
+monatomic_species = {"O", "He", "H", "Ar", "N"}     # Species with c_v = 3/2 R
 
 # Threshold for species to be considered not zero in emissions calculations
 threshold = 1e-10
@@ -102,6 +138,8 @@ frozen_nfz_exception = 3                        # Exception nfz value
 afterburning = True                 # Include afterburning in results
 problem_afterburning = "hp"         # tp, hp & uv (choose only one)
 x_ab = 4                            # Afterburning uncertainty factor
+afterburning_temperature_per_engine = False     # Also write T_ab_booster and T_ab_stage
+afterburning_balance = "gross"      # gross: clip consumed air species to zero, net: keep them negative
 
 # Fuels with specific formula to use instead of data from thermo.lib
 # When the fuel is specified here, this data will always be used instead of the thermo.lib data
@@ -182,13 +220,15 @@ nasa_cea_exe = 'FCEA2.exe'
 file_name_emission_factors = 'emission_factors.xlsx'
 sheet_name_emission_factors = 'Emission_Factors'
 
-file_name_scenarios = 'scenarios_GMD_emission.xlsx'
+file_name_scenarios = 'scenarios.xlsx'                 # GMD paper case: 'scenarios_GMD_emission.xlsx'
+file_name_scenarios = os.environ.get("LEAT_SCENARIO_FILE", file_name_scenarios)   # Optional override by environment variable
 sheet_name_scenarios = 'scenarios'
 
 file_name_launch_sites = 'launch_sites.xlsx'
 sheet_name_launch_sites = 'launch_sites'
 
-file_name_launch_vehicle = 'LV_Database_GMD.xlsx'
+file_name_launch_vehicle = 'LV_Database.xlsx'          # GMD paper case: 'LV_Database_GMD.xlsx'
+file_name_launch_vehicle = os.environ.get("LEAT_LV_DATABASE", file_name_launch_vehicle)   # Optional override by environment variable
 sheet_name_launch_vehicle = 'LV_Database'
 sheet_name_launch_vehicle_engines = 'Engine'
 

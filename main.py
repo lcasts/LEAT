@@ -3,6 +3,7 @@ from input_data.config import *
 from scripts import emissions
 from scripts import trajectory
 from scripts import data_processing
+from scripts import trajectory_recovery
 
 # 1) Import Data and Initial Data Cleaning
 df_emission_factors, df_scenarios, df_launch_sites, df_launch_vehicles, df_launch_vehicles_engines = data_processing.get_input_data()
@@ -59,3 +60,10 @@ for idx, scenario_name in enumerate(df_scenarios.index, start=1):
                 data_processing.save_emission_results(emission_results, scenario_name, "Cantera")
         except Exception as e:
              print(f"Emission calculation error: {e} with scenario: {scenario_name}.")
+
+    # 2.3) Booster recovery (RTLS, ADSL and SEA scenarios only)
+    if calculate_recovery:
+        trajectory_recovery.compute_recovery(
+            scenario_name, df_scenarios, df_launch_vehicles,
+            df_launch_vehicles_engines, df_emission_factors,
+        )

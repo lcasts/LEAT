@@ -15,7 +15,7 @@ import shutil
 import io
 from scripts import data_processing
 from scripts import trajectory
-from scipy.optimize import fsolve
+from scipy.optimize import brentq, fsolve
 
 # Suppress warnings from openpyxl
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -84,6 +84,63 @@ def rof_ab_calc(x_ab, area, mf_engine, rho_atm, v_rocket):
     rof_ab = v_rocket*rho_atm*((area*x_ab)-area)/mf_engine
     return rof_ab
 
+# Function to calculate the temperature of two gas streams mixed without reaction
+def adiabatic_mixing_temperature(gas_1, moles_1, gas_2, moles_2, pressure):
+    """Adiabatic mixing temperature of two Cantera gas streams without reaction (their states are restored)."""
+    state_1, state_2 = gas_1.TPX, gas_2.TPX
+    h_target = moles_1 * gas_1.enthalpy_mole + moles_2 * gas_2.enthalpy_mole
+
+    def residual(temperature):
+        gas_1.TP = temperature, pressure
+        gas_2.TP = temperature, pressure
+        return moles_1 * gas_1.enthalpy_mole + moles_2 * gas_2.enthalpy_mole - h_target
+
+    try:
+        t_low, t_high = sorted((state_1[0], state_2[0]))
+        if t_high - t_low < 1e-6:
+            return t_low
+        return brentq(residual, t_low, t_high, xtol=1e-6)
+    finally:
+        gas_1.TPX = state_1
+        gas_2.TPX = state_2
+
+# Function to trim the afterburning reactants to what NASA CEA accepts
+def afterburning_reactants(df_fuel_massfractions, df_air_massfractions):
+    """Fuel and air species limited to the 24 CEA reactants, with the air renormalised to the kept species."""
+    fuel_species = {species: df_fuel_massfractions[species].values[0] for species in df_fuel_massfractions.columns}
+    air_species = {species: df_air_massfractions[species].values[0] for species in df_air_massfractions.columns}
+
+    # Check and limit total species count
+    if len(fuel_species) + len(air_species) > 24:
+        # Drop *He and *Ar from air species if total species are between 24 and 26
+        air_species = {k: v for k, v in air_species.items() if k not in ["He", "Ar"]}
+
+        # If still exceeding 24, drop the smallest fuel species by mass fraction
+        if len(fuel_species) + len(air_species) > 24:
+            fuel_species = dict(sorted(fuel_species.items(), key=lambda x: x[1], reverse=True)[:24 - len(air_species)])
+
+    air_total = sum(air_species.values())
+    if air_total > 0:
+        air_species = {k: v / air_total for k, v in air_species.items()}
+
+    return fuel_species, air_species
+
+# Function to calculate the emission index of one species after afterburning
+def afterburning_emission_index(x_species, x_species_atm, rof_ab):
+    """Emission index EI = x*(rof+1) - x_atm*rof [kg/kg propellant], negative values clipped unless afterburning_balance = "net"."""
+    # A mass fraction above 1 is a broken read and is discarded
+    if x_species > 1.0 + 1e-6:
+        print(colors.YELLOW + f"Warning: mass fraction x = {x_species:.3e} > 1 discarded "
+                              f"(rof_ab = {rof_ab:.3f})" + colors.END)
+        return 0.0
+
+    emission_index = (x_species * (rof_ab + 1)) - (x_species_atm * rof_ab)
+
+    if emission_index < 0 and afterburning_balance != "net":
+        return 0.0
+
+    return emission_index
+
 # Function to create the current relevant Fuel Dataset (phase, engine, engine_massflow)
 def create_fuel_tuple(current_phase, phase, phase_time_interval, time_interval):
     fuel_data = []
@@ -105,8 +162,30 @@ def create_fuel_tuple(current_phase, phase, phase_time_interval, time_interval):
         #interval_stage_fuel_mass = engine_massflow * time_interval
         # Add data to fuel_data list
         fuel_data.append((phase, stage_engine, engine_massflow))
-        
+
     return fuel_data
+
+# Function to split the propellant mass d_m of one row between its active phases
+def phase_mass_shares(active_phases, time_intervals, df_phases):
+    # Share of phase i is (massflow_i * dt_i) / sum(massflow_j * dt_j)
+    weights = []
+    durations = []
+    for phase, interval in zip(active_phases, time_intervals):
+        current_phase = df_phases.loc[phase]
+        time_interval = max(float(interval[1]) - float(interval[0]), 0.0)
+        phase_time_interval = current_phase["time_end"] - current_phase["time_start"]
+        fuel_data = create_fuel_tuple(current_phase, phase, phase_time_interval, time_interval)
+        weights.append(sum(massflow for _, _, massflow in fuel_data) * time_interval)
+        durations.append(time_interval)
+
+    if not weights:
+        return []   # Row without active phase (e.g. first row of the trajectory)
+    if sum(weights) > 0:
+        return [weight / sum(weights) for weight in weights]
+    # Without mass flow split by time, or equally
+    if sum(durations) > 0:
+        return [duration / sum(durations) for duration in durations]
+    return [1.0 / len(weights)] * len(weights)
 
 #endregion
 
@@ -242,21 +321,8 @@ def create_inp_file(problem, filename, rocket_case=None, df=None, *args):
         # elif problem_afterburning == "sp":
         #     line += "  "+ problem_afterburning + "  s/r={} p,bar={} \n".format(s_ab/8.31451, p_ab)
         
-        # Separate fuel and air species into dictionaries with their mass fractions
-        fuel_species = {species: df_fuel_massfractions[species].values[0] for species in df_fuel_massfractions.columns}
-        air_species = {species: df_air_massfractions[species].values[0] for species in df_air_massfractions.columns}
-
-        # Check and limit total species count
-        total_species = len(fuel_species) + len(air_species)
-
-        if total_species > 24:
-            # Drop *He and *Ar from air species if total species are between 24 and 26
-            air_species = {k: v for k, v in air_species.items() if k not in ["He", "Ar"]}
-            total_species = len(fuel_species) + len(air_species)
-
-            # If still exceeding 24, drop the smallest fuel species by mass fraction
-            if total_species > 24:
-                fuel_species = dict(sorted(fuel_species.items(), key=lambda x: x[1], reverse=True)[:24 - len(air_species)])
+        # Fuel and air species, limited to the 24 reactants CEA accepts
+        fuel_species, air_species = afterburning_reactants(df_fuel_massfractions, df_air_massfractions)
 
         # Include Fuel and Air Species
         line += "react \n"
@@ -767,14 +833,17 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
             # Filter data
             active_phases = row['active_phases']
             time_intervals = row['time_interval']
-            altitude = row['h']
+            # Negative altitudes on the pad are mapped to the first altitude interval
+            altitude = max(row['h'], 0)
             # Initialize a DataFrame to hold all species emissions for the current row of iteration (a)
             total_row_emissions = pd.DataFrame(0, index=[idx], columns=emission_results.columns)
             
 
             # (b) Iterate through every "active phase and time interval pair" in the current row
                 # Multiple phases can be active within one row of a compressed time interval
-            for phase, interval in zip(active_phases, time_intervals):
+            # Share of the row's propellant mass d_m burnt in each active phase
+            phase_shares = phase_mass_shares(active_phases, time_intervals, df_phases)
+            for (phase, interval), phase_share in zip(zip(active_phases, time_intervals), phase_shares):
                 
                 # Init/Filter data
                 current_phase = df_phases.loc[phase]
@@ -789,7 +858,7 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
                 
                 # (c) Iterate through every "booster or stage" (in the new dataset fuel_data) for each "active phase and time interval pair" in the current row
                     # Multiple engines (booster or stage) can be active within the phases of iteration (b)
-                for phase, engine, engine_massflow in fuel_data:
+                for k_engine, (phase, engine, engine_massflow) in enumerate(fuel_data):
                         
                     # Determine if the engine is a booster or stage engine
                     if engine == current_phase['booster_engine']:
@@ -815,16 +884,16 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
                         )
                     ]
 
+                    # Skip if no matching altitude interval
+                    if altitude_interval_match.empty:
+                        print(f"No matching emission factors for altitude {altitude}")
+                        continue
+
                     # Select the first matching row of emission factors
                     emission_factors_row = altitude_interval_match.iloc[0]
 
                     # Create a copy of `emission_factors_row` to work with for calculation
                     df_emission_factor_fuel = emission_factors_row.copy()
-
-                    # Skip if no matching altitude interval
-                    if altitude_interval_match.empty:
-                        print(f"No matching emission factors for altitude {altitude}")
-                        continue
 
                     # Update Black Carbon Primary to Final Emission Index
                     if calculate_black_carbon:
@@ -838,7 +907,7 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
                     df_emission_factor_fuel_numeric = df_emission_factor_fuel.drop(['fuel', 'method', 'altitude_interval','BC_prim']).astype(float)
 
                     # Calculate and check massflow
-                    interval_massflow = row["d_m"]
+                    interval_massflow = row["d_m"] * phase_share
                     if interval_massflow <= 0:
                         interval_massflow = 1e-12
                     if time_interval <= 0:
@@ -849,7 +918,7 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
                     df_launch_vehicle_data = df_launch_vehicles.loc[launch_vehicle]
 
                     # Calculate and check massflow
-                    interval_massflow = row["d_m"]
+                    interval_massflow = row["d_m"] * phase_share
                     if interval_massflow <= 0:
                         interval_massflow = 1e-12
                     if time_interval <= 0:
@@ -859,10 +928,8 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
                     if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
                         booster_massflow = fuel_data[0][2]
                         stage_massflow = fuel_data[1][2]
-                        if engine == current_phase["stage_engine"]:
-                            massflow_ratio = stage_massflow/(stage_massflow+booster_massflow)
-                        elif engine == current_phase["booster_engine"]:
-                            massflow_ratio = booster_massflow/(stage_massflow+booster_massflow)
+                        # Mass flow share by position in fuel_data (booster first), as booster and core may share one engine
+                        massflow_ratio = fuel_data[k_engine][2]/(stage_massflow+booster_massflow)
                     else:
                         massflow_ratio = 1
                     total_stage_massflow = interval_massflow * massflow_ratio
@@ -882,10 +949,15 @@ def emission_factors(df_trajectory_results_cleaned, df_phases, df_scenarios, df_
             # Append total_row_emissions to total_emissions after iteration (b), (c) and (d) are finished
             total_emissions = pd.concat([total_emissions, total_row_emissions])
             total_emissions = total_emissions.fillna(0)
-            total_emissions['total_sum_species'] = total_emissions.iloc[:, 10:].sum(axis=1)
 
-        # Combine total_emissions into emission_results, while dropping the initial non-species columns of total_emissions
-        emission_results = pd.concat([emission_results, total_emissions.iloc[:, 9:]], axis=1)
+        # Species are all columns not coming from the trajectory
+        species_columns = [column for column in total_emissions.columns
+                           if column not in emission_results.columns]
+        total_emissions['total_sum_species'] = total_emissions[species_columns].sum(axis=1)
+
+        # Combine total_emissions into emission_results, while dropping the trajectory columns
+        emission_results = pd.concat(
+            [emission_results, total_emissions[['total_sum_species'] + species_columns]], axis=1)
         
     except Exception as e:
         data_processing.handle_error(e, "emission_factors", "Error in Emission Factors main function.")
@@ -904,11 +976,12 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
             loc = df_engines.columns.get_loc("p_chamber")
             df_engines = df_engines.iloc[:, :loc+1]
         else:
-            print("Spalte 'p_chamber' nicht gefunden.")
+            print("Column 'p_chamber' not found.")
         print(colors.BOLD + colors.BLUE + "Calculating Emissions using Cantera..." + colors.END)
 
         # 2. Rocket Problem - Engines
         # 2.1 Run Cantera Rocket solver for every Engine (Booster or Stage)
+        failed_engines = set()      # (phase, engine) pairs whose rocket problem failed
         for idx, row in df_engines.iterrows():
             try:
                 #Input data
@@ -999,8 +1072,8 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                 while residual > tolerance_throat:
                     num_iter += 1
                     if num_iter == max_iter_throat:
-                        break
                         print(f'Error: more than {max_iter_throat} iterations required for throat calculation')
+                        break
                     pressure_throat = pressure_throat * (1 + gamma_s * mach**2) / (1 + gamma_s)
                     
                     gas_throat.SPX = entropy_chamber, pressure_throat, mole_fractions_chamber
@@ -1061,7 +1134,7 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                 while np.abs(residual) > tolerance_exit:
                     num_iter += 1
                     
-                    if num_iter == max_iter_throat:
+                    if num_iter == max_iter_exit:
                         print(f'Error: more than {max_iter_exit} iterations required for exit calculation')
                         break
                         
@@ -1122,7 +1195,7 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                 if "exit_temperature" not in df_engines.columns:
                     df_engines["exit_temperature"] = pd.NA
 
-                # Werte in Zeile mit Index 0 setzen
+                # Store the exit state of this engine
                 df_engines.at[idx, "exit_pressure"] = exit_pressure
                 df_engines.at[idx, "exit_temperature"] = exit_temperature
                 
@@ -1142,6 +1215,7 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                 # Saving raw and formated data
                 save_output_files_cantera(gas_exit, filename, s_name)
             except Exception as e:
+                failed_engines.add((row["phase"], row["engine"]))
                 data_processing.handle_error(e, "run_cantera", "Error in Cantera main function.")
 
         # 2.2 Save Results at Exit for all Engines to Excel and copy original data for subsequent Afterburning Calculations
@@ -1152,6 +1226,10 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
         # 3. Total Emission Calculation
         # Initialize a DataFrame to hold all species emissions for all rows
         total_emissions = pd.DataFrame()
+        # Afterburning flame temperature per row: [sum(T * propellant mass), sum(propellant mass)]
+        afterburning_temperature = {}
+        # The same per engine role, key (role, row) with role 'booster' or 'stage'
+        afterburning_temperature_role = {}
 
         # (a) Iterate through every "row" of the trajectory dataset
         for idx, row in emission_results.iterrows():
@@ -1163,7 +1241,9 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
             total_row_emissions = pd.DataFrame(0.0, index=[idx], columns=emission_results.columns)
             # (b) Iterate through every "active phase and time interval pair" in the current row
                 # Multiple phases can be active within one row of a compressed time interval
-            for phase, interval in zip(active_phases, time_intervals):
+            # Share of the row's propellant mass d_m burnt in each active phase
+            phase_shares = phase_mass_shares(active_phases, time_intervals, df_phases)
+            for (phase, interval), phase_share in zip(zip(active_phases, time_intervals), phase_shares):
                 
                 # Init/Filter data
                 current_phase = df_phases.loc[phase]
@@ -1178,7 +1258,26 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                 
                 # (c) Iterate through every "booster or stage" (in the new dataset fuel_data) for each "active phase and time interval pair" in the current row
                     # Multiple engines (booster or stage) can be active within the phases of iteration (b)
-                for phase, engine, engine_massflow in fuel_data:
+                for k_engine, (phase, engine, engine_massflow) in enumerate(fuel_data):
+                    # By position in fuel_data as below: the booster comes first if the phase has one
+                    engine_role = 'booster' if k_engine == 0 and not pd.isna(current_phase["booster_engine"]) else 'stage'
+
+                    # Propellant mass of this engine in the row, needed with and without afterburning
+                    df_launch_vehicle_data = df_launch_vehicles.loc[df_scenarios.loc[scenario_name, "launch_vehicle"]]
+                    interval_massflow = row["d_m"] * phase_share
+                    if interval_massflow <= 0:
+                        interval_massflow = 1e-12
+                    massflow_ratio = 1
+                    if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
+                        booster_massflow = fuel_data[0][2]
+                        stage_massflow = fuel_data[1][2]
+                        # Mass flow share by position in fuel_data (booster first), as booster and core may share one engine
+                        massflow_ratio = fuel_data[k_engine][2]/(stage_massflow+booster_massflow)
+                    total_stage_massflow = interval_massflow * massflow_ratio
+
+                    # Skip engines without Cantera exit result (solid propellant)
+                    if cantera_skip_failed_engines and (phase, engine) in failed_engines:
+                        continue
 
                     # Including Afterburning calculation if required
                     if afterburning:
@@ -1187,27 +1286,28 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                         rho_atm, t_atm, p_atm, df_air_massfractions = data_processing.calculate_atmosphere_data(row)
                         launch_vehicle = df_scenarios.loc[scenario_name, "launch_vehicle"]
                         df_launch_vehicle_data = df_launch_vehicles.loc[launch_vehicle]
-                        if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
-                            area = df_launch_vehicles['A_R'].iloc[0]
-                        else:
-                            area = np.pi*(df_launch_vehicles['d'].iloc[0])**2 / 4
                         # Calculate and check massflow
-                        interval_massflow = row["d_m"]
+                        interval_massflow = row["d_m"] * phase_share
                         if interval_massflow <= 0:
                             interval_massflow = 1e-12
                         if time_interval <= 0:
                             time_interval = 1e-12
 
-                        # Calculate right massflow for booster and stage 
+                        # Calculate right massflow for booster and stage
                         if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
                             booster_massflow = fuel_data[0][2]
                             stage_massflow = fuel_data[1][2]
-                            if engine == current_phase["stage_engine"]:
-                                massflow_ratio = stage_massflow/(stage_massflow+booster_massflow)
-                            elif engine == current_phase["booster_engine"]:
-                                massflow_ratio = booster_massflow/(stage_massflow+booster_massflow)
+                            # Mass flow share by position in fuel_data (booster first), as booster and core may share one engine
+                            massflow_ratio = fuel_data[k_engine][2]/(stage_massflow+booster_massflow)
                         else:
                             massflow_ratio = 1
+
+                        # Reference area of the scenario vehicle, split by mass flow when booster and stage burn together
+                        if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
+                            area = df_launch_vehicle_data['A_R'] * massflow_ratio
+                        else:
+                            area = np.pi*(df_launch_vehicle_data['d'])**2 / 4
+
                         total_stage_massflow = interval_massflow * massflow_ratio
                         exhaust_massflow = interval_massflow * massflow_ratio / time_interval
                         # avoid to high massflows for small time intervals
@@ -1219,7 +1319,12 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                         rof_ab = rof_ab_calc(x_ab, area, exhaust_massflow, rho_atm, v_rocket)
 
                         atmosphere = ct.Solution(ct_species, 'air_gas')
-                        atmosphere.TPY = t_atm, p_atm, df_air_massfractions.iloc[0].to_dict()
+                        # Keep only species known to the Cantera air phase (shocked air may carry more)
+                        air_composition = {
+                            str(name).lstrip('*'): value
+                            for name, value in df_air_massfractions.iloc[0].to_dict().items()
+                            if str(name).lstrip('*') in atmosphere.species_names}
+                        atmosphere.TPY = t_atm, p_atm, air_composition
                         #atmosphere()
                         
                         # 01.2 Exhaust data:
@@ -1254,14 +1359,27 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                             moles_exhaust = 1 / (1 + molar_ratio_ab)
                             #print('moles_exhaust',moles_exhaust)
                             emission = ct.Solution(ct_species, 'rocket_emission')
-                            mix_ab = ct.Mixture([(exhaust, moles_exhaust), (atmosphere, moles_atmosphere), (emission, 0)])
                             try:
+                                # Bring both streams to their adiabatic mixing temperature, as ct.Mixture uses one temperature
+                                t_mix = adiabatic_mixing_temperature(
+                                    exhaust, moles_exhaust, atmosphere, moles_atmosphere, p_atm)
+                                exhaust.TP = t_mix, p_atm
+                                atmosphere.TP = t_mix, p_atm
+                                mix_ab = ct.Mixture([(exhaust, moles_exhaust), (atmosphere, moles_atmosphere), (emission, 0)])
                                 mix_ab.equilibrate('HP', max_iter=2000)
+                                t_acc = afterburning_temperature.setdefault(idx, [0.0, 0.0])
+                                t_acc[0] += mix_ab.T * total_stage_massflow
+                                t_acc[1] += total_stage_massflow
+                                r_acc = afterburning_temperature_role.setdefault((engine_role, idx), [0.0, 0.0])
+                                r_acc[0] += mix_ab.T * total_stage_massflow
+                                r_acc[1] += total_stage_massflow
                             except Exception as e:
                                 print('Error during Cantera afterburning equilibrate:', e)
                         else:
-                            print('Afterburning skipped due to low rof_ab:', rof_ab)
+                            print('Afterburning skipped due to rof_ab outside [0.01, 10*x_ab):', rof_ab)
                             emission = exhaust
+                            # Without air the emission indices are the nozzle exit mass fractions
+                            rof_ab = 0.0
 
                         """
                         print('Afterburning equilibrate done')
@@ -1273,9 +1391,12 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                         # Get species names and corresponding mass fractions
                         species = emission.species_names
                         value = emission.Y
-                        df_air_massfractions = df_air_massfractions.T
+                        # Air side of the emission index is the undisturbed air
+                        df_air_massfractions = df_air_massfractions.attrs.get(
+                            'reference_air', df_air_massfractions).T
                         df_air_massfractions.columns = ['air_massfractions']
                         # Loop through each species in the filtered DataFrame
+                        # Float zeros, pandas 3 does not write floats into int columns
                         df_emissions = pd.DataFrame(0.0, index=species, columns=['afterburning_emissions'])
                         for species, value in zip(species, value):
                             if value > threshold > 0:
@@ -1286,20 +1407,20 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
                                     df_emissions.loc[species, 'afterburning_emissions'] = None
                         
                         # Saving data
-                        save_output_files_cantera(gas_exit, afterburning_filename, s_name)
+                        save_output_files_cantera(emission, afterburning_filename, s_name)
                         
+                        # Reset the species of the current phase and engine pair to zero
+                        df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0
+
                         # Prepare DataFrame for Afterburning Emission Index Calculation
                         combined_df = df_emissions.join(df_air_massfractions, how='outer').fillna(0)
                         # Loop through the combined_df to calculate the emission index for each species
                         for species, row2 in combined_df.iterrows():
-                            x_species = row2['afterburning_emissions']
-                            x_species_atm = row2['air_massfractions']
-                            EI_species = (x_species * (rof_ab + 1)) - (x_species_atm * rof_ab)
-                            if EI_species < 0 or EI_species > 1.1:
-                                EI_species = 0
+                            EI_species = afterburning_emission_index(
+                                row2['afterburning_emissions'], row2['air_massfractions'], rof_ab)
 
-                            # Update the species mass fraction in df_engines if the value is above the threshold
-                            if EI_species > threshold:
+                            # Update the species if outside the threshold band, negative values are consumed air
+                            if abs(EI_species) > threshold:
                                 df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), species] = EI_species
                                  
                         # Fill NaN to avoid errors in the following calculations
@@ -1353,10 +1474,26 @@ def run_cantera(df_trajectory_results_cleaned, df_phases, df_scenarios, df_launc
             # Append total_row_emissions to total_emissions after iteration (b), (c) and (d) are finished
             total_emissions = pd.concat([total_emissions, total_row_emissions])
             total_emissions = total_emissions.fillna(0)
-            total_emissions['total_sum_species'] = total_emissions.iloc[:, 10:].sum(axis=1)
 
-        # Combine total_emissions into emission_results, while dropping the initial non-species columns of total_emissions
-        emission_results = pd.concat([emission_results, total_emissions.iloc[:, 9:]], axis=1)
+        # Species are all columns not coming from the trajectory
+        species_columns = [column for column in total_emissions.columns
+                           if column not in emission_results.columns]
+        total_emissions['total_sum_species'] = total_emissions[species_columns].sum(axis=1)
+
+        # Combine total_emissions into emission_results, while dropping the trajectory columns
+        emission_results = pd.concat(
+            [emission_results, total_emissions[['total_sum_species'] + species_columns]], axis=1)
+        # Afterburning temperature T_ab [K], placed before total_sum_species
+        if afterburning_temperature:
+            emission_results.insert(
+                emission_results.columns.get_loc('total_sum_species'), 'T_ab',
+                pd.Series({i: acc[0] / acc[1] for i, acc in afterburning_temperature.items() if acc[1] > 0}))
+            if afterburning_temperature_per_engine:
+                for role in ('booster', 'stage'):
+                    emission_results.insert(
+                        emission_results.columns.get_loc('total_sum_species'), f'T_ab_{role}',
+                        pd.Series({i: acc[0] / acc[1] for (r, i), acc in afterburning_temperature_role.items()
+                                   if r == role and acc[1] > 0}, dtype=float))
         
         
         # 4. Clean up - Remove thermo.lib and trans.lib
@@ -1503,6 +1640,10 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
         # 3. Total Emission Calculation
         # Initialize a DataFrame to hold all species emissions for all rows
         total_emissions = pd.DataFrame()
+        # Afterburning flame temperature per row: [sum(T * propellant mass), sum(propellant mass)]
+        afterburning_temperature = {}
+        # The same per engine role, key (role, row) with role 'booster' or 'stage'
+        afterburning_temperature_role = {}
 
         # (a) Iterate through every "row" of the trajectory dataset
         for idx, row in emission_results.iterrows():
@@ -1516,7 +1657,9 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
 
             # (b) Iterate through every "active phase and time interval pair" in the current row
                 # Multiple phases can be active within one row of a compressed time interval
-            for phase, interval in zip(active_phases, time_intervals):
+            # Share of the row's propellant mass d_m burnt in each active phase
+            phase_shares = phase_mass_shares(active_phases, time_intervals, df_phases)
+            for (phase, interval), phase_share in zip(zip(active_phases, time_intervals), phase_shares):
                 
                 # Init/Filter data
                 current_phase = df_phases.loc[phase]
@@ -1531,7 +1674,22 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
                 
                 # (c) Iterate through every "booster or stage" (in the new dataset fuel_data) for each "active phase and time interval pair" in the current row
                     # Multiple engines (booster or stage) can be active within the phases of iteration (b)
-                for phase, engine, engine_massflow in fuel_data:
+                for k_engine, (phase, engine, engine_massflow) in enumerate(fuel_data):
+                    # By position in fuel_data as below: the booster comes first if the phase has one
+                    engine_role = 'booster' if k_engine == 0 and not pd.isna(current_phase["booster_engine"]) else 'stage'
+
+                    # Propellant mass of this engine in the row, needed with and without afterburning
+                    df_launch_vehicle_data = df_launch_vehicles.loc[df_scenarios.loc[scenario_name, "launch_vehicle"]]
+                    interval_massflow = row["d_m"] * phase_share
+                    if interval_massflow <= 0:
+                        interval_massflow = 1e-12
+                    massflow_ratio = 1
+                    if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
+                        booster_massflow = fuel_data[0][2]
+                        stage_massflow = fuel_data[1][2]
+                        # Mass flow share by position in fuel_data (booster first), as booster and core may share one engine
+                        massflow_ratio = fuel_data[k_engine][2]/(stage_massflow+booster_massflow)
+                    total_stage_massflow = interval_massflow * massflow_ratio
 
                     # Including Afterburning calculation if required
                     if afterburning:
@@ -1541,27 +1699,28 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
                         rho_atm, t_atm, p_atm, df_air_massfractions = data_processing.calculate_atmosphere_data(row)
                         launch_vehicle = df_scenarios.loc[scenario_name, "launch_vehicle"]
                         df_launch_vehicle_data = df_launch_vehicles.loc[launch_vehicle]
-                        if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
-                            area = df_launch_vehicles['A_R'].iloc[0]
-                        else:
-                            area = np.pi*(df_launch_vehicles['d'].iloc[0])**2 / 4
                         # Calculate and check massflow
-                        interval_massflow = row["d_m"]
+                        interval_massflow = row["d_m"] * phase_share
                         if interval_massflow <= 0:
                             interval_massflow = 1e-12
                         if time_interval <= 0:
                             time_interval = 1e-12
 
-                        # Calculate right massflow for booster and stage 
+                        # Calculate right massflow for booster and stage
                         if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
                             booster_massflow = fuel_data[0][2]
                             stage_massflow = fuel_data[1][2]
-                            if engine == current_phase["stage_engine"]:
-                                massflow_ratio = stage_massflow/(stage_massflow+booster_massflow)
-                            elif engine == current_phase["booster_engine"]:
-                                massflow_ratio = booster_massflow/(stage_massflow+booster_massflow)
+                            # Mass flow share by position in fuel_data (booster first), as booster and core may share one engine
+                            massflow_ratio = fuel_data[k_engine][2]/(stage_massflow+booster_massflow)
                         else:
                             massflow_ratio = 1
+
+                        # Reference area of the scenario vehicle, split by mass flow when booster and stage burn together
+                        if df_launch_vehicle_data['start_with_booster'] == True and phase == 'Phase_1':
+                            area = df_launch_vehicle_data['A_R'] * massflow_ratio
+                        else:
+                            area = np.pi*(df_launch_vehicle_data['d'])**2 / 4
+
                         total_stage_massflow = interval_massflow * massflow_ratio
                         exhaust_massflow = interval_massflow * massflow_ratio / time_interval
                         # avoid to high massflows for small time intervals
@@ -1601,119 +1760,145 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
                         if t_air < 160.1:
                             t_air = 160.1
 
-                        # 02. NASA CEA Afterburning Calculation of Exhaust and Atmosphere for current "phase, engine pair"
-                        afterburning_filename = scenario_name + "_" + str(interval_start)
-                        problem = "afterburning"
-                        s_name = phase + "_" + engine + "_" + problem
+                        # For rof_ab >= 10*x_ab (almost no exhaust) use the nozzle exit composition
+                        if rof_ab >= x_ab * 10:
+                            print('Afterburning skipped due to rof_ab >= 10*x_ab:', rof_ab)
+                            engine_mask = (df_engines['phase'] == phase) & (df_engines['engine'] == engine)
+                            # Reset the species, then write the exit mass fractions without the leading '*'
+                            df_engines.loc[engine_mask, df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0
+                            exit_columns = df_engines_original_data.columns[df_engines_original_data.columns.get_loc('exit_temperature') + 1:]
+                            for species, value in df_engines_original_data.loc[engine_mask, exit_columns].iloc[0].items():
+                                if species.startswith('exit_'):
+                                    continue    # e.g. exit_density, not a species
+                                if value > threshold:
+                                    df_engines.loc[engine_mask, re.sub(r'^\*', '', species)] = value
+                        else:
+                            # 02. NASA CEA Afterburning Calculation of Exhaust and Atmosphere for current "phase, engine pair"
+                            afterburning_filename = scenario_name + "_" + str(interval_start)
+                            problem = "afterburning"
+                            s_name = phase + "_" + engine + "_" + problem
 
-                        # Creat .inp file, run NASA CEA & read results
-                        create_inp_file(problem, afterburning_filename, None, None, t_ab, p_ab, rho_ab, s_ab, t_fuel, rho_fuel, t_air, rof_ab, df_fuel_massfractions, df_air_massfractions)
+                            # Creat .inp file, run NASA CEA & read results
+                            create_inp_file(problem, afterburning_filename, None, None, t_ab, p_ab, rho_ab, s_ab, t_fuel, rho_fuel, t_air, rof_ab, df_fuel_massfractions, df_air_massfractions)
 
-                        try:
-                            # Execute NASA CEA
-                            process = subprocess.Popen(
-                                [nasa_cea_folder_path + nasa_cea_exe],
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL,  # Suppresses standard output
-                                stderr=subprocess.PIPE      # Catch error output
-                            )
-
-                            process.stdin.write(f"{afterburning_filename}\n".encode())
-                            process.stdin.close()
-                            process.wait()  # Wait until process is finished
-
-                            # Check for errors
-                            if process.returncode != 0:
-                                error_message = process.stderr.read().decode()
-                                print("Error while executing NASA CEA:", error_message)
-                                continue
-                            #Process the output file
-                            df_output = readCEA(problem_afterburning, afterburning_filename)
-                        
-                            # Saving raw and formated data
-                            save_files(afterburning_filename, s_name, rocket_case)
-                            clean_directory(afterburning_filename)
-                            save_results_excel(afterburning_filename, s_name, df_output, rocket_case)
-                        except Exception as e:
-                            time = row['t']
-                            alt = row['h']
-                            print(f"NASA CEA error: {e} at time {time}s and altitude {alt}. Calculating emissions with stoichiometric factors.")
-                            # Filter `df_emission_factors` by fuel type and method
-                            df_emission_factors['altitude_interval'] = df_emission_factors['altitude_interval'].apply(
-                                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-                            )
-                            
-                            df_emission_factor_fuel = df_emission_factors[
-                                (df_emission_factors['fuel'] == current_fuel_type_str) &
-                                (df_emission_factors['method'] == emission_factor_method)
-                            ]
-
-                            altitude_interval_match = df_emission_factor_fuel[
-                                df_emission_factor_fuel['altitude_interval'].apply(
-                                    lambda x: isinstance(x, list) and len(x) == 2 and x[0] <= alt <= x[1]
+                            try:
+                                # Execute NASA CEA
+                                process = subprocess.Popen(
+                                    [nasa_cea_folder_path + nasa_cea_exe],
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,  # Suppresses standard output
+                                    stderr=subprocess.PIPE      # Catch error output
                                 )
-                            ]
-                            # Skip if no matching altitude interval
-                            if altitude_interval_match.empty:
-                                print(f"No matching emission factors for altitude {alt}")
-                                continue
-                            emission_factors_row = altitude_interval_match.iloc[0]
-                            df_emission_factor_fuel = emission_factors_row.copy()
+
+                                process.stdin.write(f"{afterburning_filename}\n".encode())
+                                process.stdin.close()
+                                process.wait()  # Wait until process is finished
+
+                                # Check for errors
+                                if process.returncode != 0:
+                                    error_message = process.stderr.read().decode()
+                                    print("Error while executing NASA CEA:", error_message)
+                                    continue
+                                #Process the output file
+                                df_output = readCEA(problem_afterburning, afterburning_filename)
+                        
+                                # Saving raw and formated data
+                                save_files(afterburning_filename, s_name, rocket_case)
+                                clean_directory(afterburning_filename)
+                                save_results_excel(afterburning_filename, s_name, df_output, rocket_case)
+                            except Exception as e:
+                                time = row['t']
+                                alt = row['h']
+                                print(f"NASA CEA error: {e} at time {time}s and altitude {alt}. Calculating emissions with stoichiometric factors.")
+                                # Fuel of the current engine, set here because it is otherwise only defined further below
+                                fallback_fuel = current_phase['booster_fuel'] if engine_role == 'booster' else current_phase['stage_fuel']
+                                current_fuel_type_str = "/".join(fallback_fuel)
+                                # Filter `df_emission_factors` by fuel type and method
+                                df_emission_factors['altitude_interval'] = df_emission_factors['altitude_interval'].apply(
+                                    lambda x: ast.literal_eval(x) if isinstance(x, str) else x
+                                )
                             
-                            # Filter to keep only numeric columns for multiplication
-                            df_emission_factor_fuel_numeric = df_emission_factor_fuel.drop(['fuel', 'method', 'altitude_interval','BC_prim']).astype(float)
+                                df_emission_factor_fuel = df_emission_factors[
+                                    (df_emission_factors['fuel'] == current_fuel_type_str) &
+                                    (df_emission_factors['method'] == emission_factor_method)
+                                ]
+
+                                altitude_interval_match = df_emission_factor_fuel[
+                                    df_emission_factor_fuel['altitude_interval'].apply(
+                                        lambda x: isinstance(x, list) and len(x) == 2 and x[0] <= alt <= x[1]
+                                    )
+                                ]
+                                # Skip if no matching altitude interval
+                                if altitude_interval_match.empty:
+                                    print(f"No matching emission factors for altitude {alt}")
+                                    continue
+                                emission_factors_row = altitude_interval_match.iloc[0]
+                                df_emission_factor_fuel = emission_factors_row.copy()
+                            
+                                # Filter to keep only numeric columns for multiplication
+                                df_emission_factor_fuel_numeric = df_emission_factor_fuel.drop(['fuel', 'method', 'altitude_interval','BC_prim']).astype(float)
  
-                            # Create base emission factor Series from row
-                            df_output = df_emission_factor_fuel_numeric.copy()
+                                # Create base emission factor Series from row
+                                df_output = df_emission_factor_fuel_numeric.copy()
 
-                            # Convert Series to DataFrame with the correct structure:
-                            # Species (including CO2, NOx, etc.) as index, values under 'exit' column
-                            df_output = df_output.to_frame(name='exit')
+                                # Convert Series to DataFrame with the correct structure:
+                                # Species (including CO2, NOx, etc.) as index, values under 'exit' column
+                                df_output = df_output.to_frame(name='exit')
 
-                            # Add standard thermodynamic fields at the top with 0.0 values
-                            standard_fields = pd.DataFrame({
-                                'exit': {
-                                    'p': 0.0,
-                                    't': 0.0,
-                                    'mach': 0.0,
-                                    'H': 0.0,
-                                    'rho': 0.0,
-                                    's': 0.0
-                                }
-                            })
+                                # Add standard thermodynamic fields at the top with 0.0 values
+                                standard_fields = pd.DataFrame({
+                                    'exit': {
+                                        'p': 0.0,
+                                        't': 0.0,
+                                        'mach': 0.0,
+                                        'H': 0.0,
+                                        'rho': 0.0,
+                                        's': 0.0
+                                    }
+                                })
 
-                            # Concatenate thermodynamic + emission species vertically
-                            df_output = pd.concat([standard_fields, df_output])
+                                # Concatenate thermodynamic + emission species vertically
+                                df_output = pd.concat([standard_fields, df_output])
 
-                        # 03. Update df_engines with the results
-                        # 03.1 Set all species mass fractions to zero for the current phase and engine pair
-                        df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0
+                            # Afterburning temperature weighted with the propellant mass (t = 0 marks the fallback)
+                            t_flame = float(df_output.loc['t', 'exit'])
+                            if t_flame > 0:
+                                t_acc = afterburning_temperature.setdefault(idx, [0.0, 0.0])
+                                t_acc[0] += t_flame * total_stage_massflow
+                                t_acc[1] += total_stage_massflow
+                                r_acc = afterburning_temperature_role.setdefault((engine_role, idx), [0.0, 0.0])
+                                r_acc[0] += t_flame * total_stage_massflow
+                                r_acc[1] += total_stage_massflow
+
+                            # 03. Update df_engines with the results
+                            # 03.1 Set all species mass fractions to zero for the current phase and engine pair
+                            df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), df_engines.columns[df_engines.columns.get_loc('exit_temperature') + 1:]] = 0
                         
-                        # 03.2 Combine the dataframes df_output and df_air_massfractions to include all relevant species
-                        # Drop the initial rows from df_output
-                        df_output_filtered = df_output.iloc[6:]
-                        df_output_filtered.columns = ['ab_output_filtered']
-                        df_output_filtered.index = df_output_filtered.index.str.replace(r'^\*', '', regex=True)
+                            # 03.2 Combine the dataframes df_output and df_air_massfractions to include all relevant species
+                            # Drop the initial rows from df_output
+                            df_output_filtered = df_output.iloc[6:]
+                            df_output_filtered.columns = ['ab_output_filtered']
+                            df_output_filtered.index = df_output_filtered.index.str.replace(r'^\*', '', regex=True)
                         
-                        # Transpose df_air_massfractions
-                        df_air_massfractions = df_air_massfractions.transpose()
-                        df_air_massfractions.columns = ['air_massfractions']
-                        df_air_massfractions.index = df_air_massfractions.index.str.replace(r'^\*', '', regex=True)
-                        
-                        # Combine the dataframes
-                        combined_df = pd.concat([df_output_filtered, df_air_massfractions], axis=1, join='outer').fillna(0)
+                            # Air side is the undisturbed air as passed to CEA (reference_air for a recovery)
+                            _, air_species_used = afterburning_reactants(
+                                df_fuel_massfractions,
+                                df_air_massfractions.attrs.get('reference_air', df_air_massfractions))
+                            df_air_massfractions = pd.DataFrame.from_dict(
+                                air_species_used, orient='index', columns=['air_massfractions'])
+                            df_air_massfractions.index = df_air_massfractions.index.str.replace(r'^\*', '', regex=True)
 
-                        # Update the species mass fractions (emission factors) in df_engines for the current phase and engine pair
-                        for species, row2 in combined_df.iterrows():
-                            x_species = row2['ab_output_filtered']
-                            x_species_atm = row2['air_massfractions']
-                            EI_species = (x_species * (rof_ab + 1)) - (x_species_atm * rof_ab)
-                            if EI_species < 0 or EI_species > 1.1:
-                                EI_species = 0
+                            # Combine the dataframes
+                            combined_df = pd.concat([df_output_filtered, df_air_massfractions], axis=1, join='outer').fillna(0)
 
-                            # Update the species mass fraction in df_engines if the value is above the threshold
-                            if EI_species > threshold:
-                                df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), species] = EI_species              
+                            # Update the species mass fractions (emission factors) in df_engines for the current phase and engine pair
+                            for species, row2 in combined_df.iterrows():
+                                EI_species = afterburning_emission_index(
+                                    row2['ab_output_filtered'], row2['air_massfractions'], rof_ab)
+
+                                # Update the species if outside the threshold band, negative values are consumed air
+                                if abs(EI_species) > threshold:
+                                    df_engines.loc[(df_engines['phase'] == phase) & (df_engines['engine'] == engine), species] = EI_species
                     
                     # Fill Nan to avoid errors in following calculation
                     df_engines = df_engines.fillna(0)
@@ -1771,10 +1956,26 @@ def run_nasa_cea(df_trajectory_results_cleaned, df_phases, df_scenarios, df_laun
             # Append total_row_emissions to total_emissions after iteration (b), (c) and (d) are finished
             total_emissions = pd.concat([total_emissions, total_row_emissions])
             total_emissions = total_emissions.fillna(0)
-            total_emissions['total_sum_species'] = total_emissions.iloc[:, 10:].sum(axis=1)
 
-        # Combine total_emissions into emission_results, while dropping the initial non-species columns of total_emissions
-        emission_results = pd.concat([emission_results, total_emissions.iloc[:, 9:]], axis=1)
+        # Species are all columns not coming from the trajectory
+        species_columns = [column for column in total_emissions.columns
+                           if column not in emission_results.columns]
+        total_emissions['total_sum_species'] = total_emissions[species_columns].sum(axis=1)
+
+        # Combine total_emissions into emission_results, while dropping the trajectory columns
+        emission_results = pd.concat(
+            [emission_results, total_emissions[['total_sum_species'] + species_columns]], axis=1)
+        # Afterburning temperature T_ab [K], placed before total_sum_species
+        if afterburning_temperature:
+            emission_results.insert(
+                emission_results.columns.get_loc('total_sum_species'), 'T_ab',
+                pd.Series({i: acc[0] / acc[1] for i, acc in afterburning_temperature.items() if acc[1] > 0}))
+            if afterburning_temperature_per_engine:
+                for role in ('booster', 'stage'):
+                    emission_results.insert(
+                        emission_results.columns.get_loc('total_sum_species'), f'T_ab_{role}',
+                        pd.Series({i: acc[0] / acc[1] for (r, i), acc in afterburning_temperature_role.items()
+                                   if r == role and acc[1] > 0}, dtype=float))
         #print(colors.BOLD + colors.BLUE + "Emission Data:" + colors.END)
         #print(emission_results.head())
         emission_results = emission_results.loc[:, (emission_results != 0).any(axis=0)]

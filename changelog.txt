@@ -1,7 +1,123 @@
 Changelog containing the version history and information on new features
 
-V1.0.0 Version for GMD paper, updated Cantera emission calculation, added open cycle CEA calculation, bug fixes
+V1.1.0 (2026-11)
+Added
+- Atmosphere: pressure, isentropic exponent, gas constant and speed of sound from the local NRLMSIS gas mixture (atmosphere_mixture); new trajectory output columns kappa and r_mix
+- Booster recovery flights (RTLS, ADSL, SEA) with trajectory and emissions of the returning booster (scripts/trajectory_recovery.py, scripts/emissions_recovery.py, telemetry templates in input_data/recovery/); descent afterburning against the air behind the bow shock (NASA CEA shock problem, recovery_shock) and air NOx of unpowered supersonic rows; Falcon Heavy side boosters use the Falcon-9 template twice; off by default (calculate_recovery = False); optional scenario columns t_recovery_end and recovery_landing_burn
+- Use cases as new default input: input_data/scenarios.xlsx (UC1 Ariane 6 CSO-3, UC2/UC3 Inmarsat 6 F2, UC4 Starlink 5492 recovery variants, UC5 Starship flight 8) and input_data/LV_Database.xlsx (GMD vehicles plus Falcon-9 Inmarsat ADSL/RTLS/Expended and Falcon-9 RTLS; all Falcon-9 entries with the dissertation values incl. A_e_A_R = 0.5 and UP); the GMD inputs stay available (scenarios_GMD_emission.xlsx, LV_Database_GMD.xlsx)
+- Launch vehicle database can be set with the environment variable LEAT_LV_DATABASE
+- Trajectory stops when the last stage burns out; optional scenario column h_break_km for an individual stop altitude
+- Optional LV_Database column UP (ballast mass added to the payload, default 0)
+- Phase logic for boosters that burn longer than or as long as stage 1 (e.g. GSLV Mk II)
+- Afterburning: new output column T_ab (optionally T_ab_booster/T_ab_stage) and option afterburning_balance ("gross"/"net")
+- Options launch_vehicle_aliases (map other vehicle names to a database entry) and cantera_skip_failed_engines
+- Scenario file can be set with the environment variable LEAT_SCENARIO_FILE
+- Warnings for unknown launch sites, skipped afterburning and mole fractions above 1
+Changed
+- Propellant mass per time step d_m is the mass of the actual solver step; the burn integral is correct with start-up ramp and Max-Q throttling
+- d_m is split between active phases and engines (phase_mass_shares) instead of giving every active phase the full d_m
+- Afterburning: Cantera mixes exhaust and air at the adiabatic mixing temperature before the HP equilibrium; in phase 1 the reference area is split by the mass-flow ratio; emission indices above 1 are kept and mole fractions above 1 are discarded; for rof_ab >= 10*x_ab the nozzle exit composition is used
+- Air composition renormalised to the species accepted by NASA CEA
+- total_sum_species summed over the species columns by name
+Fixed
+- Skin friction: unit conversion of dynamic pressure and length (q/47.88, l/0.3048); the skin-friction drag was too low by about a factor of 3
+- Afterburning cross-section taken from the scenario's launch vehicle instead of the first database entry
+- NameError when afterburning = False
+- Height grid in compress starts at the lowest altitude, so rows below the launch altitude are no longer lost
+- calculate_force() without an active phase (returned two instead of three values)
+- Emission factor lookup for negative altitudes and empty matches
+- Cantera: engine data reset per row; rof_ab = 0 when afterburning is skipped
+- launch_sites.xlsx: longitude of BOWEN corrected (148.1131)
+- Cantera afterburning output file written from the afterburning result instead of the nozzle exit state
+- NASA CEA afterburning fallback to emission factors: fuel type set before use
+- Cantera nozzle exit iteration limited by max_iter_exit instead of max_iter_throat
 
-V0.2.0 Implemented Cantera emission calculation, emission plot script and bug fixes
+V1.0.0 (2026-04-09)
+Version for the GMD paper: new example inputs, azimuth-based ground track, time-based throttling and start-up ramp, emission mass per trajectory step, area-based afterburning ratio
+Added
+- New example inputs for the GMD paper: LV_Database_GMD.xlsx replaces LV_Database.xlsx (Falcon-9 v1.2 (Block5) Expended/ADSL, Ariane 62, Starship V1.0 (RTLS), Starship V2 / V2.0 RTLS; new LV columns Payload, TotalMass, Propellant Mass); scenarios_GMD_emission.xlsx replaces scenarios.xlsx (2025_Starship_IFT8_gt_1, 2023-013_Starlink5492_gt_1, 2025_Ariane_VA263_gt_1)
+- Engine sheet: new engines GEM_60, Raptor, Raptor_Vac, YF-100, YF-100K, YF-115 and RD-843; Vulcain_21 set to gas-generator cycle (mf_oc 0.0153, rof_oc 0.9, Ae/At_oc 2.3, p_chamber_oc 130 bar); Merlin_1D/1D_vac set back to closed cycle (C)
+- Air launch: initial velocity of 920 km/h for LauncherOne and Pegasus XL
+- launch_sites.xlsx extended from 52 to 101 sites, new columns az_min/az_max (azimuth range, informational) and source reference in the README sheet
+Changed
+- Scenario input changed (old scenario files are not compatible): inclination -> azimuth, h_fr_start/h_fr_end -> t_fr_start/t_fr_end (time-based Max-Q throttling), new column t_startup (linear thrust and mass-flow ramp-up after lift-off)
+- Ground track (coordinates) from the great-circle formula with launch azimuth instead of the Napier-rule approximation with inclination
+- Emission mass per trajectory step (emission factors, NASA CEA, Cantera): d_m of the step times the booster/stage mass-flow share instead of phase-averaged mass flow times interval length; afterburning exhaust mass flow capped at the engine mass flow
+- Area-based afterburning air-to-exhaust ratio rof_ab = v*rho*(A*x_ab - A)/mdot (x_ab scales the plume area instead of the diameter); booster detection uses the scenario's launch vehicle and a boolean start_with_booster
+- Afterburning emission indices outside 0 to 1.1 set to 0 (NASA CEA and Cantera)
+- NASA CEA started via subprocess.Popen with stdin; return code checked, failed runs skipped with an error message
+- Robustness: Cantera rocket calculation wrapped per engine in try/except; trajectory and emission calculation wrapped per scenario in main.py, so one failing scenario no longer stops the run; emission_factors, run_nasa_cea and run_cantera also take df_scenarios
+- emission_factors.xlsx: new column CL2 (Barker2024_seco, HTPB/AP); BC_prim added to all Barker2024_seco entries; Barker2024_seco HTPB/AP HCL/CL updated, top altitude bin extended to [119,150], new HTPB/O2(L) entry
+- emission_factors.xlsx, stoichiometric method: new fuels HTPB/H2O2(L) and CH3NO2(L)/N2O(L), plus PBAN/AL(cr)/NH4CLO4(I) and C2H8N2(L),UDMH/N2H4(L)/N2O4(L) (BC_prim only); corrected HTPB/O2(L) (CO2 0.764, H2O 0.236, no N2) and RP-1/H2O2(L) (CO2 0.379, H2O 0.621); CO removed from UDMH/N2O4
+- config defaults: all_scenarios = True, use_nasa_cea = use_cantera = True, emission_factor_method = "Barker2024_seco", height_ode_break = 120 km, compress_interval = 0.5 km, threshold = 1e-10, x_ab = 4
+- requirements.txt: version pins removed; README: cea_species.yaml added to the folder structure
+Fixed
+- Missing scipy interp1d import in trajectory.py; Ariane 62 P120 thrust curve and Starship-specific code paths disabled
 
-V0.1.0 Initial release
+Update 2026-06-11
+- Drag model: base-pressure drag term uses the launch vehicle parameter A_e_A_R, (1 - A_e_A_R), instead of (1 - A_R/A_R); the column A_e_A_R is required (added to the data on 2026-10-26)
+
+Update 2026-10-26
+- LV_Database_GMD.xlsx: new column A_e_A_R (ratio of engine exhaust area to reference area A_R; 1 for all vehicles, so the base-pressure drag stays zero), described in the README sheet; unused column d_exit removed from sheet Engine
+
+V0.3.0 (2025-07-29)
+Rewritten Cantera emission calculation, open-cycle (gas generator) NASA CEA calculation, bug fixes
+Added
+- NASA CEA open-cycle support: engines with engine_cycle = "GG" get a second CEA rocket run for the gas-generator exhaust (problem type "rocket_oc" with rof_oc, p_chamber_oc and Ae/At_oc); exit mass fractions of main nozzle and gas generator combined, weighted by the gas-generator mass-flow share mf_oc
+- LV_Database.xlsx, sheet Engine: new columns engine_cycle (C/GG), mf_oc, rof_oc, Ae/At_oc and p_chamber_oc; Merlin_1D and Merlin_1D_vac set to GG
+- input_data/cea_species.yaml: NASA CEA thermodynamic data in Cantera format (about 2,085 species) with reactant phases (H2(L), O2(L), UDMH, CH4(L), CH6N2(L), N2O4(L), RP-1, Al(cr), NH4CLO4(I), HTPB, PBAN), product phases and an air phase; new config option file_name_ct_species
+- config special_fuels: BTTN, RDX, CAB and PBAN with enthalpy and chemical formula for NASA CEA
+- Fallback to emission_factors.xlsx (emission_factor_method) when a NASA CEA afterburning run fails
+- Mass flow reduced together with the thrust during the force-reduction window (h_fr_start to h_fr_end)
+- Time-dependent P120 booster thrust curve for launch_vehicle "Ariane_62"
+- Example trajectory input input_data/trajectory_2023-013_Starlink5492_input.csv (replaces trajectory_results_cleaned.csv); README describes the required columns (t, h, date, lon, lat, v, d_m, active_phases, time_interval)
+- output_data/plots/ folder, also cleared by cleanup_output_data.py
+Changed
+- Cantera calculation rewritten to follow the NASA CEA approach (replaces the GRI-3.0/h2o2 model of V0.2.0): HP equilibrium of the liquid/solid reactants in the chamber, shifting-equilibrium throat and exit iteration with CEA-style thermodynamic derivatives (get_thermo_derivatives, get_thermo_properties, calculate_c_star) up to the engine Ae/At, afterburning as HP equilibrium of exhaust and atmosphere
+- Cantera afterburning skipped if rof_ab < 0.01 or rof_ab >= 10*x_ab; removed functions calculate_reactant_enthalpy, mach_number, combustion_chamber, nozzle_expansion, atmosphere_mixing; no fixed kappa = 1.4 or d_exit any more; Cantera output files contain T, p, density and species mass fractions
+- Afterburning air-to-exhaust ratio: config rof_f ("afterburning diameter factor", default 4) replaced by x_ab ("afterburning uncertainty factor", default 2)
+- Afterburning (CEA and Cantera) uses the trajectory mass change d_m of the interval as exhaust mass flow; for Phase_1 of vehicles starting with boosters the plume diameter is derived from A_R
+- emission_factors.xlsx always loaded when NASA CEA or Cantera is used, not only for black carbon
+- Emission factor results get a total_sum_species column; result columns aligned with the CEA/Cantera output
+- Drag model (Fleeman): new unit conversion in the skin-friction term; Ma = 1 falls in the subsonic branch; base-pressure term uses (1 - A_R/A_R) instead of the constant 0.556, so it evaluates to 0
+- plot_emissions.py: fixed colours per species, top-5 species per 5 km altitude bin with console output, coloured pie chart; plots and summary saved to output_data/plots/
+- config defaults: example scenario 2023-013_Starlink5492 with external trajectory; clarified comments (frozen_nfz, trace, threshold, black carbon after James et al. 2021)
+Fixed
+- NASA CEA afterburning error handling (invalid pd.df_output call of V0.2.0 replaced)
+- readCEA also replaces the overflow value "******" (in addition to "*****")
+- Temporary CEA afterburning files removed after each run (clean_directory)
+
+Update 2026-02-24
+- Fixed: gravity turn above h_gt_end uses dgamma/dt = -(g/v - v/(R_0+h))*cos(gamma) (previously sin(gamma))
+
+V0.2.0 (2025-04-30)
+Implemented Cantera emission calculation, emission plot script and bug fixes
+Added
+- Cantera emission calculation (config use_cantera, emissions.run_cantera, output "Cantera"): HP equilibrium in the chamber (H2/O2 with h2o2.yaml, CH4/O2 with gri30.yaml), isentropic nozzle expansion to Ae/At with fixed kappa = 1.4, afterburning by mixing the exhaust with MSIS air and HP equilibrium, black carbon from emission factors
+- LV_Database.xlsx, sheet Engine: new column d_exit (nozzle exit diameter, used by Cantera)
+- output_data/plot_emissions.py: top-5 species per 5 km altitude bin (up to 100 km), pie chart of total emission shares, Excel summary of total emissions per species
+- Test vehicles and scenarios CH4_Test and H2_Test
+- Warning for user_defined_scenarios that are not in scenarios.xlsx
+- requirements.txt: cantera 3.1.0 and matplotlib 3.8.2 (numpy pinned to 1.26.3)
+- changelog.txt
+Changed
+- Atmospheric species names without the "*" prefix (N2, O2, O, He, H, Ar, NO) in config molar_masses and in the atmosphere data; leading "*" stripped from NASA CEA output species
+- Default example scenario 2023-010_Starlink5277
+- __pycache__ files removed from the repository
+Fixed
+- NASA CEA afterburning: air temperature limited to at least 160.1 K; CEA call wrapped in try/except; readCEA replaces the overflow value "*****" by 1.00
+- Debug prints removed from the trajectory ODE
+- emission_factors.xlsx: BC_prim = 0 for stoichiometric H2(L)/O2(L)
+
+V0.1.0 (2025-01-09)
+Initial release
+- Trajectory simulation (ODE with solve_ivp) with gravity turn, thrust interpolation between sea level and vacuum, Max-Q force reduction, Fleeman drag model and NRLMSIS atmosphere via pymsis; optional external trajectory data
+- Phase model from LV_Database.xlsx (boosters/stages, propellant masses and fractions); compression of trajectory results by time or height
+- Emission calculation with emission factors (emission_factors.xlsx, method selectable) or NASA CEA (rocket problem equilibrium/frozen with nfz exceptions for HTPB/PBAN, afterburning with the atmosphere as tp/hp/uv problem, special_fuels with user-defined formula and enthalpy)
+- Altitude-dependent black carbon from BC_prim
+- Input files config.py, emission_factors.xlsx, launch_sites.xlsx, LV_Database.xlsx, scenarios.xlsx, trajectory_results_cleaned.csv; utility cleanup_output_data.py
+- Emission factor sets stoichiometric, Ross2009, Ross2014, Larson2017, Ryan2022, Pradon2023, Brown2024, Barker2024 and tool values for RP-1/O2
+Update 2025-01-30/31 (emission factor database)
+- emission_factors.xlsx extended from 53 to 3,060 entries: altitude-resolved sets Barker2024_prim and Barker2024_seco (1 km bins 0-120 km), James2021 primary and secondary per launch vehicle (17 vehicles), LEAT (5 propellants, 5 km bins 0-120 km, replaces "tool")
+- Species columns: new Cly, NOx and NO2; Cl renamed to CL; O2 removed; literature NO values moved to NOx, Brown2024/Barker2024 Cl moved to Cly
+- Altitude interval of the global sets extended from [0,100] to [0,120]; README sheet rewritten
